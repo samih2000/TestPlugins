@@ -1,0 +1,42 @@
+[
+    {
+        "iconUrl": "https://upload.wikimedia.org/wikipedia/commons/2/2f/Korduene_Logo.png",
+        "fileHash": "sha256-bf290f09cec5ae650bd265e540864410ce9257b76e62633b6475e2bb738f7149",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/samih2000/TestPlugins",
+        "fileSize": 7367,
+        "status": 1,
+        "language": "en",
+        "authors": [
+            "Cloudburst",
+            "Luna712"
+        ],
+        "tvTypes": [
+            "Movie"
+        ],
+        "version": 1,
+        "internalName": "ExampleProvider",
+        "description": "Lorem ipsum",
+        "url": "https://raw.githubusercontent.com/samih2000/TestPlugins/builds/ExampleProvider.cs3",
+        "name": "ExampleProvider"
+    },
+    {
+        "iconUrl": "https://raindrop.io/favicon.ico",
+        "fileHash": "sha256-e5ecab778050d76f1925785be40bc088e3ce2cd89e7e731b9fd69d9b6d96da9f",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/samih2000/TestPlugins",
+        "fileSize": 29732,
+        "status": 1,
+        "authors": [
+            "YourName"
+        ],
+        "tvTypes": [
+            "Others"
+        ],
+        "version": 1,
+        "internalName": "RaindropProvider",
+        "description": "Browse and play your Raindrop.io video bookmarks",
+        "url": "https://raw.githubusercontent.com/samih2000/TestPlugins/builds/RaindropProvider.cs3",
+        "name": "RaindropProvider"
+    }
+]
