@@ -1,0 +1,61 @@
+[
+    {
+        "url": "https://raw.githubusercontent.com/samih2000/TestPlugins/builds/ExampleProvider.cs3",
+        "status": 1,
+        "version": 1,
+        "name": "ExampleProvider",
+        "internalName": "ExampleProvider",
+        "authors": [
+            "Cloudburst",
+            "Luna712"
+        ],
+        "description": "Lorem ipsum",
+        "fileSize": 7367,
+        "repositoryUrl": "https://github.com/samih2000/TestPlugins",
+        "language": "en",
+        "tvTypes": [
+            "Movie"
+        ],
+        "iconUrl": "https://upload.wikimedia.org/wikipedia/commons/2/2f/Korduene_Logo.png",
+        "apiVersion": 1,
+        "fileHash": "sha256-db24f8acabda278bb47b27c10155dacd5d334fc06544d8302a9426ebc431d75c"
+    },
+    {
+        "url": "https://raw.githubusercontent.com/samih2000/TestPlugins/builds/RaindropProvider.cs3",
+        "status": 1,
+        "version": 1,
+        "name": "RaindropProvider",
+        "internalName": "RaindropProvider",
+        "authors": [
+            "YourName"
+        ],
+        "description": "Browse and play your Raindrop.io video bookmarks",
+        "fileSize": 36781,
+        "repositoryUrl": "https://github.com/samih2000/TestPlugins",
+        "tvTypes": [
+            "Others"
+        ],
+        "iconUrl": "https://raindrop.io/favicon.ico",
+        "apiVersion": 1,
+        "fileHash": "sha256-56f04c01c5bf4a4eb3683bd87924f9bd7d0d4f5ffbbf403238e826c453215884"
+    },
+    {
+        "url": "https://raw.githubusercontent.com/samih2000/TestPlugins/builds/TwitterAccounts.cs3",
+        "status": 0,
+        "version": 1,
+        "name": "TwitterAccounts",
+        "internalName": "TwitterAccounts",
+        "authors": [
+            "YourName"
+        ],
+        "description": "Browse media from specific X/Twitter accounts (requires login cookies)",
+        "fileSize": 24266,
+        "repositoryUrl": "https://github.com/samih2000/TestPlugins",
+        "tvTypes": [
+            "Others"
+        ],
+        "iconUrl": "https://abs.twimg.com/favicons/twitter.ico",
+        "apiVersion": 1,
+        "fileHash": "sha256-049c43c7400ae93598f2f83a6a62dbfdc3d7bd83db40f98edea6e64ab75057af"
+    }
+]
