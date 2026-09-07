@@ -1,0 +1,8 @@
+{
+    "name": "samih2000",
+    "description": "Personal Raindrop bookmarks plugin",
+    "manifestVersion": 1,
+    "pluginLists": [
+        "https://raw.githubusercontent.com/samih2000/TestPlugins/builds/plugins.json"
+    ]
+}
