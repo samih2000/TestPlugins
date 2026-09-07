@@ -52,8 +52,7 @@ class RaindropProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val perPage = 50
         val url = "$mainUrl/rest/v1/raindrops/0" +
-                "?search=" + URLEncoder.encode("type:video", "UTF-8") +
-                "&page=${page - 1}&perpage=$perPage&sort=-created"
+        "?page=${page - 1}&perpage=$perPage&sort=-created"
 
         val res = app.get(url, headers = authHeaders()).parsedSafe<RaindropListResponse>()
             ?: return newHomePageResponse(emptyList(), hasNext = false)
@@ -79,7 +78,7 @@ class RaindropProvider : MainAPI() {
 
     // ---------- Search ----------
     override suspend fun search(query: String): List<SearchResponse> {
-        val q = URLEncoder.encode("$query type:video", "UTF-8")
+        val q = URLEncoder.encode(query, "UTF-8")
         val url = "$mainUrl/rest/v1/raindrops/0?search=$q&perpage=50"
         val res = app.get(url, headers = authHeaders()).parsedSafe<RaindropListResponse>()
             ?: return emptyList()
