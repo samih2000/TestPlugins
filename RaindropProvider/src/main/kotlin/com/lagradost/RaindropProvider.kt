@@ -7,6 +7,9 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import java.net.URLEncoder
 
 class RaindropProvider : MainAPI() {
@@ -35,39 +38,94 @@ class RaindropProvider : MainAPI() {
         val count: Int
     )
 
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val perPage = 50
-        val url = "$mainUrl/rest/v1/raindrops/0" +
-                "?page=${page - 1}&perpage=$perPage&sort=-created"
+    data class RaindropTag(val _id: String, val count: Int)
+    data class RaindropTagsResponse(val items: List<RaindropTag>)
 
-        val res = app.get(url, headers = authHeaders()).parsedSafe<RaindropListResponse>()
-            ?: return newHomePageResponse(emptyList(), hasNext = false)
+    data class VxMedia(val type: String?, val url: String?, val thumbnail_url: String?)
+    data class VxTweet(val media_extended: List<VxMedia>?, val mediaURLs: List<String>?)
 
-        val items = res.items.map { it.toSearchResponse(this) }
-        val hasNext = (page - 1) * perPage + items.size < res.count
-
-        return newHomePageResponse(
-            list = listOf(HomePageList("Video bookmarks", items)),
-            hasNext = hasNext
-        )
+    private suspend fun fetchVxTweet(tweetUrl: String): VxTweet? {
+        val match = Regex("(?:x|twitter)\\.com/([^/]+)/status/(\\d+)").find(tweetUrl) ?: return null
+        val (username, tweetId) = match.destructured
+        return try {
+            val json = app.get(
+                "https://api.vxtwitter.com/$username/status/$tweetId",
+                headers = mapOf("User-Agent" to "Mozilla/5.0")
+            ).text
+            tryParseJson<VxTweet>(json)
+        } catch (e: Exception) {
+            null
+        }
     }
 
-    private fun RaindropItem.toSearchResponse(provider: MainAPI): SearchResponse {
+    private suspend fun RaindropItem.toSearchResponse(provider: MainAPI): SearchResponse {
+        val poster = cover?.takeIf { it.isNotBlank() }
+            ?: fetchVxTweet(link)?.media_extended?.firstOrNull()?.thumbnail_url
+
         return provider.newMovieSearchResponse(
             title ?: link,
             link,
             TvType.Movie
         ) {
-            this.posterUrl = cover
+            this.posterUrl = poster
         }
     }
 
+    private suspend fun fetchShelf(searchQuery: String?, perPage: Int): List<SearchResponse> = coroutineScope {
+        val q = searchQuery?.let { "&search=" + URLEncoder.encode(it, "UTF-8") } ?: ""
+        val res = app.get(
+            "$mainUrl/rest/v1/raindrops/0?sort=-created&perpage=$perPage$q",
+            headers = authHeaders()
+        ).parsedSafe<RaindropListResponse>()
+
+        res?.items?.map { async { it.toSearchResponse(this@RaindropProvider) } }?.awaitAll()
+            ?: emptyList()
+    }
+
+    private suspend fun fetchRandomShelf(perPage: Int = 12): List<SearchResponse> = coroutineScope {
+        val countRes = app.get("$mainUrl/rest/v1/raindrops/0?perpage=1", headers = authHeaders())
+            .parsedSafe<RaindropListResponse>()
+        val total = countRes?.count ?: 0
+        if (total == 0) return@coroutineScope emptyList()
+
+        val pageSize = 50
+        val totalPages = ((total - 1) / pageSize) + 1
+        val randomPage = (0 until totalPages).random()
+
+        val res = app.get(
+            "$mainUrl/rest/v1/raindrops/0?perpage=$pageSize&page=$randomPage",
+            headers = authHeaders()
+        ).parsedSafe<RaindropListResponse>()
+
+        res?.items?.shuffled()?.take(perPage)
+            ?.map { async { it.toSearchResponse(this@RaindropProvider) } }?.awaitAll()
+            ?: emptyList()
+    }
+
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val tagsRes = app.get("$mainUrl/rest/v1/tags/0", headers = authHeaders())
+            .parsedSafe<RaindropTagsResponse>()
+        val topTags = tagsRes?.items?.sortedByDescending { it.count }?.take(10) ?: emptyList()
+
+        val lists = coroutineScope {
+            val recentDeferred = async { HomePageList("Recently Added", fetchShelf(null, 15)) }
+            val randomDeferred = async { HomePageList("Random Picks", fetchRandomShelf(12)) }
+
+            val tagDeferreds = topTags.map { tag ->
+                async {
+                    val items = fetchShelf("tag:\"${tag._id}\"", 10)
+                    if (items.isEmpty()) null else HomePageList(tag._id, items)
+                }
+            }
+
+            listOf(recentDeferred.await(), randomDeferred.await()) + tagDeferreds.awaitAll().filterNotNull()
+        }
+
+        return newHomePageResponse(list = lists, hasNext = false)
+    }
+
     override suspend fun search(query: String): List<SearchResponse> {
-        val q = URLEncoder.encode(query, "UTF-8")
-        val url = "$mainUrl/rest/v1/raindrops/0?search=$q&perpage=50"
-        val res = app.get(url, headers = authHeaders()).parsedSafe<RaindropListResponse>()
-            ?: return emptyList()
-        return res.items.map { it.toSearchResponse(this) }
+        return fetchShelf(query, 50)
     }
 
     override suspend fun load(url: String): LoadResponse {
@@ -76,20 +134,20 @@ class RaindropProvider : MainAPI() {
             .parsedSafe<RaindropListResponse>()
         val item = res?.items?.firstOrNull()
 
+        val poster = item?.cover?.takeIf { it.isNotBlank() }
+            ?: fetchVxTweet(url)?.media_extended?.firstOrNull()?.thumbnail_url
+
         return newMovieLoadResponse(
             item?.title ?: url,
             url,
             TvType.Movie,
             url
         ) {
-            this.posterUrl = item?.cover
+            this.posterUrl = poster
             this.plot = item?.excerpt
             this.tags = item?.tags
         }
     }
-
-    data class VxMedia(val type: String?, val url: String?)
-    data class VxTweet(val media_extended: List<VxMedia>?, val mediaURLs: List<String>?)
 
     override suspend fun loadLinks(
         data: String,
@@ -97,15 +155,7 @@ class RaindropProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val match = Regex("(?:x|twitter)\\.com/([^/]+)/status/(\\d+)").find(data) ?: return false
-        val (username, tweetId) = match.destructured
-
-        val json = app.get(
-            "https://api.vxtwitter.com/$username/status/$tweetId",
-            headers = mapOf("User-Agent" to "Mozilla/5.0")
-        ).text
-
-        val tweet = tryParseJson<VxTweet>(json) ?: return false
+        val tweet = fetchVxTweet(data) ?: return false
 
         val videoUrl = tweet.media_extended
             ?.firstOrNull { it.type == "video" || it.type == "gif" }
