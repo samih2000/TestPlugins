@@ -28,6 +28,8 @@ android {
 }
 
 dependencies {
-    // Add any extra dependencies here if needed
+    // Needed for coroutineScope/async/awaitAll (proper parallel fetching) —
+    // compileOnly since Cloudstream's host app already bundles coroutines at
+    // runtime; we just need the symbols available at compile time.
+    compileOnly("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3")
 }
-
