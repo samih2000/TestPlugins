@@ -1,12 +1,16 @@
 package com.lagradost
 
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.fasterxml.jackson.module.kotlin.readValue
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import java.net.URLEncoder
 
 class RaindropProvider : MainAPI() {
@@ -17,6 +21,7 @@ class RaindropProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Others)
 
     private val raindropToken = "6431f39f-a72a-41c9-b1a8-712b68484c5f"
+    private val mapper = jacksonObjectMapper()
 
     private fun authHeaders() = mapOf("Authorization" to "Bearer $raindropToken")
 
@@ -49,7 +54,7 @@ class RaindropProvider : MainAPI() {
                 "https://api.vxtwitter.com/$username/status/$tweetId",
                 headers = mapOf("User-Agent" to "Mozilla/5.0")
             ).text
-            tryParseJson<VxTweet>(json)
+            mapper.readValue<VxTweet>(json)
         } catch (e: Exception) {
             null
         }
@@ -68,21 +73,22 @@ class RaindropProvider : MainAPI() {
         }
     }
 
-    private suspend fun fetchShelf(searchQuery: String?, perPage: Int): List<SearchResponse> {
+    private suspend fun fetchShelf(searchQuery: String?, perPage: Int): List<SearchResponse> = coroutineScope {
         val q = searchQuery?.let { "&search=" + URLEncoder.encode(it, "UTF-8") } ?: ""
         val res = app.get(
             "$mainUrl/rest/v1/raindrops/0?sort=-created&perpage=$perPage$q",
             headers = authHeaders()
         ).parsedSafe<RaindropListResponse>()
 
-        return res?.items?.apmap { it.toSearchResponse(this) } ?: emptyList()
+        res?.items?.map { async { it.toSearchResponse(this@RaindropProvider) } }?.awaitAll()
+            ?: emptyList()
     }
 
-    private suspend fun fetchRandomShelf(perPage: Int = 12): List<SearchResponse> {
+    private suspend fun fetchRandomShelf(perPage: Int = 12): List<SearchResponse> = coroutineScope {
         val countRes = app.get("$mainUrl/rest/v1/raindrops/0?perpage=1", headers = authHeaders())
             .parsedSafe<RaindropListResponse>()
         val total = countRes?.count ?: 0
-        if (total == 0) return emptyList()
+        if (total == 0) return@coroutineScope emptyList()
 
         val pageSize = 50
         val totalPages = ((total - 1) / pageSize) + 1
@@ -93,7 +99,8 @@ class RaindropProvider : MainAPI() {
             headers = authHeaders()
         ).parsedSafe<RaindropListResponse>()
 
-        return res?.items?.shuffled()?.take(perPage)?.apmap { it.toSearchResponse(this) }
+        res?.items?.shuffled()?.take(perPage)
+            ?.map { async { it.toSearchResponse(this@RaindropProvider) } }?.awaitAll()
             ?: emptyList()
     }
 
@@ -102,15 +109,21 @@ class RaindropProvider : MainAPI() {
             .parsedSafe<RaindropTagsResponse>()
         val topTags = tagsRes?.items?.sortedByDescending { it.count }?.take(10) ?: emptyList()
 
-        val recent = HomePageList("Recently Added", fetchShelf(null, 15))
-        val random = HomePageList("Random Picks", fetchRandomShelf(12))
+        val lists = coroutineScope {
+            val recentDeferred = async { HomePageList("Recently Added", fetchShelf(null, 15)) }
+            val randomDeferred = async { HomePageList("Random Picks", fetchRandomShelf(12)) }
 
-        val tagLists = topTags.apmap { tag ->
-            val items = fetchShelf("tag:\"${tag._id}\"", 10)
-            if (items.isEmpty()) null else HomePageList(tag._id, items)
-        }.filterNotNull()
+            val tagDeferreds = topTags.map { tag ->
+                async {
+                    val items = fetchShelf("tag:\"${tag._id}\"", 10)
+                    if (items.isEmpty()) null else HomePageList(tag._id, items)
+                }
+            }
 
-        return newHomePageResponse(list = listOf(recent, random) + tagLists, hasNext = false)
+            listOf(recentDeferred.await(), randomDeferred.await()) + tagDeferreds.awaitAll().filterNotNull()
+        }
+
+        return newHomePageResponse(list = lists, hasNext = false)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
