@@ -12,6 +12,8 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import java.net.URLEncoder
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 
 class RaindropProvider : MainAPI() {
     override var mainUrl = "https://api.raindrop.io"
@@ -22,6 +24,7 @@ class RaindropProvider : MainAPI() {
 
     private val raindropToken = "6431f39f-a72a-41c9-b1a8-712b68484c5f"
     private val mapper = jacksonObjectMapper()
+    private val vxSemaphore = Semaphore(5)
 
     private fun authHeaders() = mapOf("Authorization" to "Bearer $raindropToken")
 
@@ -47,9 +50,10 @@ class RaindropProvider : MainAPI() {
     data class VxTweet(val media_extended: List<VxMedia>?, val mediaURLs: List<String>?)
 
     private suspend fun fetchVxTweet(tweetUrl: String): VxTweet? {
-        val match = Regex("(?:x|twitter)\\.com/([^/]+)/status/(\\d+)").find(tweetUrl) ?: return null
-        val (username, tweetId) = match.destructured
-        return try {
+    val match = Regex("(?:x|twitter)\\.com/([^/]+)/status/(\\d+)").find(tweetUrl) ?: return null
+    val (username, tweetId) = match.destructured
+    return vxSemaphore.withPermit {
+        try {
             val json = app.get(
                 "https://api.vxtwitter.com/$username/status/$tweetId",
                 headers = mapOf("User-Agent" to "Mozilla/5.0")
@@ -59,6 +63,7 @@ class RaindropProvider : MainAPI() {
             null
         }
     }
+}
 
     private suspend fun RaindropItem.toSearchResponse(provider: MainAPI): SearchResponse {
         val poster = cover?.takeIf { it.isNotBlank() }
