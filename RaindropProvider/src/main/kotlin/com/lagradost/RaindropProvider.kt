@@ -11,9 +11,9 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import java.net.URLEncoder
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import java.net.URLEncoder
 
 class RaindropProvider : MainAPI() {
     override var mainUrl = "https://api.raindrop.io"
@@ -24,6 +24,7 @@ class RaindropProvider : MainAPI() {
 
     private val raindropToken = "6431f39f-a72a-41c9-b1a8-712b68484c5f"
     private val mapper = jacksonObjectMapper()
+
     private val vxSemaphore = Semaphore(5)
 
     private fun authHeaders() = mapOf("Authorization" to "Bearer $raindropToken")
@@ -43,31 +44,28 @@ class RaindropProvider : MainAPI() {
         val count: Int
     )
 
-    data class RaindropTag(val _id: String, val count: Int)
-    data class RaindropTagsResponse(val items: List<RaindropTag>)
-
     data class VxMedia(val type: String?, val url: String?, val thumbnail_url: String?)
     data class VxTweet(val media_extended: List<VxMedia>?, val mediaURLs: List<String>?)
 
     private suspend fun fetchVxTweet(tweetUrl: String): VxTweet? {
-    val match = Regex("(?:x|twitter)\\.com/([^/]+)/status/(\\d+)").find(tweetUrl) ?: return null
-    val (username, tweetId) = match.destructured
-    return vxSemaphore.withPermit {
-        try {
-            val json = app.get(
-                "https://api.vxtwitter.com/$username/status/$tweetId",
-                headers = mapOf("User-Agent" to "Mozilla/5.0")
-            ).text
-            mapper.readValue<VxTweet>(json)
-        } catch (e: Exception) {
-            null
+        val match = Regex("(?:x|twitter)\\.com/([^/]+)/status/(\\d+)").find(tweetUrl) ?: return null
+        val (username, tweetId) = match.destructured
+        return vxSemaphore.withPermit {
+            try {
+                val json = app.get(
+                    "https://api.vxtwitter.com/$username/status/$tweetId",
+                    headers = mapOf("User-Agent" to "Mozilla/5.0")
+                ).text
+                mapper.readValue<VxTweet>(json)
+            } catch (e: Exception) {
+                null
+            }
         }
     }
-}
 
     private suspend fun RaindropItem.toSearchResponse(provider: MainAPI): SearchResponse {
-        val poster = cover?.takeIf { it.isNotBlank() }
-            ?: fetchVxTweet(link)?.media_extended?.firstOrNull()?.thumbnail_url
+        val poster = fetchVxTweet(link)?.media_extended?.firstOrNull()?.thumbnail_url
+            ?: cover?.takeIf { it.isNotBlank() }
 
         return provider.newMovieSearchResponse(
             title ?: link,
@@ -109,19 +107,34 @@ class RaindropProvider : MainAPI() {
             ?: emptyList()
     }
 
+    private suspend fun fetchTopTags(sampleSize: Int = 200, topN: Int = 10): List<String> {
+        val res = app.get(
+            "$mainUrl/rest/v1/raindrops/0?perpage=$sampleSize&sort=-created",
+            headers = authHeaders()
+        ).parsedSafe<RaindropListResponse>()
+
+        return res?.items
+            ?.flatMap { it.tags ?: emptyList() }
+            ?.groupingBy { it }
+            ?.eachCount()
+            ?.entries
+            ?.sortedByDescending { it.value }
+            ?.take(topN)
+            ?.map { it.key }
+            ?: emptyList()
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val tagsRes = app.get("$mainUrl/rest/v1/tags/0", headers = authHeaders())
-            .parsedSafe<RaindropTagsResponse>()
-        val topTags = tagsRes?.items?.sortedByDescending { it.count }?.take(10) ?: emptyList()
+        val topTags = fetchTopTags()
 
         val lists = coroutineScope {
             val recentDeferred = async { HomePageList("Recently Added", fetchShelf(null, 15)) }
             val randomDeferred = async { HomePageList("Random Picks", fetchRandomShelf(12)) }
 
-            val tagDeferreds = topTags.map { tag ->
+            val tagDeferreds = topTags.map { tagName ->
                 async {
-                    val items = fetchShelf("tag:\"${tag._id}\"", 10)
-                    if (items.isEmpty()) null else HomePageList(tag._id, items)
+                    val items = fetchShelf("tag:\"$tagName\"", 10)
+                    if (items.isEmpty()) null else HomePageList(tagName, items)
                 }
             }
 
@@ -141,8 +154,8 @@ class RaindropProvider : MainAPI() {
             .parsedSafe<RaindropListResponse>()
         val item = res?.items?.firstOrNull()
 
-        val poster = item?.cover?.takeIf { it.isNotBlank() }
-            ?: fetchVxTweet(url)?.media_extended?.firstOrNull()?.thumbnail_url
+        val poster = fetchVxTweet(url)?.media_extended?.firstOrNull()?.thumbnail_url
+            ?: item?.cover?.takeIf { it.isNotBlank() }
 
         return newMovieLoadResponse(
             item?.title ?: url,
@@ -184,4 +197,3 @@ class RaindropProvider : MainAPI() {
         return true
     }
 }
-
