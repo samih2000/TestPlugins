@@ -9,4 +9,9 @@ class RaindropPlugin : Plugin() {
     override fun load(context: Context) {
         registerMainAPI(RaindropProvider())
     }
+
+    override fun openSettings(context: Context): Any {
+        RaindropSettings.show(context)
+        return Unit
+    }
 }
