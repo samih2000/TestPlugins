@@ -22,7 +22,8 @@ class RaindropProvider : MainAPI() {
     override var lang = "en"
     override val supportedTypes = setOf(TvType.Others)
 
-    private val raindropToken = "6431f39f-a72a-41c9-b1a8-712b68484c5f"
+    private val raindropToken: String
+    get() = com.lagradost.cloudstream3.CloudStreamApp.getKey<String>(RAINDROP_TOKEN_KEY) ?: ""
     private val mapper = jacksonObjectMapper()
 
     private val vxSemaphore = Semaphore(5)
