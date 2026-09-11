@@ -134,7 +134,7 @@ class RaindropProvider : MainAPI() {
 
             val tagDeferreds = topTags.map { tagName ->
                 async {
-                    val items = fetchShelf("tag:\"$tagName\"", 10)
+                    val items = fetchShelf("#$tagName", 6)
                     if (items.isEmpty()) null else HomePageList(tagName, items)
                 }
             }
