@@ -7,9 +7,12 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
-import com.lagradost.cloudstream3.CloudStreamApp
 
 const val RAINDROP_TOKEN_KEY = "raindrop_token"
+private const val PREFS_NAME = "raindrop_provider_settings"
+
+fun raindropPrefs(context: Context) =
+    context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
 object RaindropSettings {
     fun show(context: Context) {
@@ -27,7 +30,7 @@ object RaindropSettings {
             setPadding(0, 0, 0, pad)
         })
 
-        val currentToken = CloudStreamApp.getKey<String>(RAINDROP_TOKEN_KEY) ?: ""
+        val currentToken = raindropPrefs(context).getString(RAINDROP_TOKEN_KEY, "") ?: ""
         val input = EditText(context).apply {
             hint = "Raindrop token"
             setText(currentToken)
@@ -54,7 +57,9 @@ object RaindropSettings {
             .setTitle("Raindrop Videos — Settings")
             .setView(layout)
             .setPositiveButton("Save") { _, _ ->
-                CloudStreamApp.setKey(RAINDROP_TOKEN_KEY, input.text.toString().trim())
+                raindropPrefs(context).edit()
+                    .putString(RAINDROP_TOKEN_KEY, input.text.toString().trim())
+                    .apply()
                 Toast.makeText(context, "Saved", Toast.LENGTH_SHORT).show()
             }
             .setNegativeButton("Cancel", null)
