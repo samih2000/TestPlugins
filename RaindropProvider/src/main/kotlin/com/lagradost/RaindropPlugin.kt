@@ -8,10 +8,6 @@ import com.lagradost.cloudstream3.plugins.Plugin
 class RaindropPlugin : Plugin() {
     override fun load(context: Context) {
         registerMainAPI(RaindropProvider())
-    }
-
-    override fun openSettings(context: Context): Any {
-        RaindropSettings.show(context)
-        return Unit
+        openSettings = { ctx -> RaindropSettings.show(ctx) }
     }
 }
