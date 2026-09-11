@@ -23,9 +23,9 @@ class RaindropProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Others)
 
     private val raindropToken: String
-    get() = com.lagradost.cloudstream3.CloudStreamApp.getKey<String>(RAINDROP_TOKEN_KEY) ?: ""
-    private val mapper = jacksonObjectMapper()
-
+    get() = com.lagradost.cloudstream3.CloudStreamApp.context
+        ?.let { raindropPrefs(it).getString(RAINDROP_TOKEN_KEY, "") }
+        ?: ""
     private val vxSemaphore = Semaphore(5)
 
     private fun authHeaders() = mapOf("Authorization" to "Bearer $raindropToken")
