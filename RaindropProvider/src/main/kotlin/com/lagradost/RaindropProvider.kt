@@ -176,12 +176,13 @@ class RaindropProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val tweet = fetchVxTweet(data) ?: return false
+        val tweet = fetchVxTweet(data)
 
-        val videoUrl = tweet.media_extended
+        val videoUrl = tweet?.media_extended
             ?.firstOrNull { it.type == "video" || it.type == "gif" }
             ?.url
-            ?: tweet.mediaURLs?.firstOrNull { it.endsWith(".mp4") }
+            ?: tweet?.mediaURLs?.firstOrNull { it.endsWith(".mp4") }
+            ?: fetchViaAuthenticatedTwitter(data)
             ?: return false
 
         callback.invoke(
@@ -196,5 +197,61 @@ class RaindropProvider : MainAPI() {
             }
         )
         return true
+    }
+
+    private suspend fun fetchViaAuthenticatedTwitter(tweetUrl: String): String? {
+        val ctx = com.lagradost.cloudstream3.CloudStreamApp.context ?: return null
+        val prefs = raindropPrefs(ctx)
+        val authToken = prefs.getString(TWITTER_AUTH_TOKEN_KEY, null)
+        val ct0 = prefs.getString(TWITTER_CT0_KEY, null)
+        if (authToken.isNullOrBlank() || ct0.isNullOrBlank()) return null
+
+        val tweetId = Regex("status/(\\d+)").find(tweetUrl)?.groupValues?.get(1) ?: return null
+
+        val variables = "{\"tweetId\":\"$tweetId\",\"includePromotedContent\":true," +
+                "\"withBirdwatchNotes\":true,\"withVoice\":true,\"withCommunity\":true}"
+        val features = "{\"creator_subscriptions_tweet_preview_api_enabled\":true," +
+                "\"c9s_tweet_anatomy_moderator_badge_enabled\":true," +
+                "\"responsive_web_graphql_exclude_directive_enabled\":true," +
+                "\"verified_phone_label_enabled\":false," +
+                "\"tweet_awards_web_tipping_enabled\":false," +
+                "\"responsive_web_graphql_skip_user_profile_image_extensions_enabled\":false," +
+                "\"responsive_web_graphql_timeline_navigation_enabled\":true," +
+                "\"rweb_tipjar_consumption_enabled\":true," +
+                "\"freedom_of_speech_not_reach_fetch_enabled\":true," +
+                "\"standardized_nudges_misinfo\":true," +
+                "\"tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled\":true," +
+                "\"rweb_video_timestamps_enabled\":true," +
+                "\"longform_notetweets_rich_text_read_enabled\":true," +
+                "\"longform_notetweets_inline_media_enabled\":true," +
+                "\"responsive_web_enhance_cards_enabled\":false}"
+
+        val url = "https://x.com/i/api/graphql/2ICDjqPd81tulZcYrtpTuQ/TweetResultByRestId" +
+                "?variables=" + URLEncoder.encode(variables, "UTF-8") +
+                "&features=" + URLEncoder.encode(features, "UTF-8")
+
+        val json = try {
+            app.get(
+                url,
+                headers = mapOf(
+                    "Authorization" to ("Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6" +
+                            "I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"),
+                    "x-csrf-token" to ct0,
+                    "Cookie" to "auth_token=$authToken; ct0=$ct0",
+                    "User-Agent" to "Mozilla/5.0"
+                )
+            ).text
+        } catch (e: Exception) {
+            return null
+        }
+
+        val mp4Urls = Regex("\"url\":\"(https:[^\"]+\\.mp4[^\"]*)\"")
+            .findAll(json)
+            .map { it.groupValues[1].replace("\\/", "/") }
+            .toList()
+
+        return mp4Urls.maxByOrNull {
+            Regex("/vid/\\d+x(\\d+)/").find(it)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        }
     }
 }
