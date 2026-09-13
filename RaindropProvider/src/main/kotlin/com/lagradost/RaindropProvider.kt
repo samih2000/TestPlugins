@@ -34,13 +34,13 @@ class RaindropProvider : MainAPI() {
 
     private fun authHeaders() = mapOf("Authorization" to "Bearer $raindropToken")
 
-    private val vxSemaphore = Semaphore(1)
-    private val vxDelayMs = 500L
+    private val vxSemaphore = Semaphore(3)
+    private val vxDelayMs = 300L
     private val vxCache = mutableMapOf<String, VxTweet?>()
     private val vxCacheMutex = Mutex()
 
-    private val twSemaphore = Semaphore(1)
-    private val twDelayMs = 500L
+    private val twSemaphore = Semaphore(3)
+    private val twDelayMs = 300L
     private val twCache = mutableMapOf<String, VxTweet?>()
     private val twCacheMutex = Mutex()
 
