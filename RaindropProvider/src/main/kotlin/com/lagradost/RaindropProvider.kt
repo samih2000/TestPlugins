@@ -259,24 +259,24 @@ class RaindropProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val topTags = fetchTopTags(topN = 5)
+    val topTags = fetchTopTags(topN = 4)
 
-        val lists = coroutineScope {
-            val recentDeferred = async { HomePageList("Recently Added", fetchShelf(null, 8)) }
-            val randomDeferred = async { HomePageList("Random Picks", fetchRandomShelf(8)) }
+    val lists = coroutineScope {
+        val recentDeferred = async { HomePageList("Recently Added", fetchShelf(null, 6)) }
+        val randomDeferred = async { HomePageList("Random Picks", fetchRandomShelf(6)) }
 
-            val tagDeferreds = topTags.map { tagName ->
-                async {
-                    val items = fetchShelf("#$tagName", 6)
-                    if (items.isEmpty()) null else HomePageList(tagName, items)
-                }
+        val tagDeferreds = topTags.map { tagName ->
+            async {
+                val items = fetchShelf("#$tagName", 4)
+                if (items.isEmpty()) null else HomePageList(tagName, items)
             }
-
-            listOf(recentDeferred.await(), randomDeferred.await()) + tagDeferreds.awaitAll().filterNotNull()
         }
 
-        return newHomePageResponse(list = lists, hasNext = false)
+        listOf(recentDeferred.await(), randomDeferred.await()) + tagDeferreds.awaitAll().filterNotNull()
     }
+
+    return newHomePageResponse(list = lists, hasNext = false)
+}
 
     override suspend fun search(query: String): List<SearchResponse> {
         return fetchShelf(query, 50)
