@@ -78,7 +78,7 @@ class TwitterAccountsProvider : MainAPI() {
                 val json = app.get(url, headers = authHeaders(ct0, authToken)).text
                 val root = mapper.readTree(json)
                 val instructions = root.path("data").path("user").path("result")
-                    .path("timeline_v2").path("timeline").path("instructions")
+                    .path("timeline").path("timeline").path("instructions")
 
                 if (instructions.isMissingNode || !instructions.isArray) {
                     emptyList<SearchResponse>() to "No instructions array found. Raw: ${json.take(4000)}"
@@ -88,9 +88,24 @@ class TwitterAccountsProvider : MainAPI() {
                         else emptyList()
                     }
 
-                    val results = entries.mapNotNull { entry ->
-                        var node = entry.path("content").path("itemContent")
-                            .path("tweet_results").path("result")
+                    // The Media tab groups tweets into "module" entries containing
+                    // a grid of items, rather than one tweet per entry directly.
+                    val tweetNodes = entries.flatMap { entry ->
+                        val content = entry.path("content")
+                        if (content.path("__typename").asText() == "TimelineTimelineModule") {
+                            content.path("items").mapNotNull { item ->
+                                val node = item.path("item").path("itemContent")
+                                    .path("tweet_results").path("result")
+                                if (node.isMissingNode) null else node
+                            }
+                        } else {
+                            val node = content.path("itemContent").path("tweet_results").path("result")
+                            if (node.isMissingNode) emptyList() else listOf(node)
+                        }
+                    }
+
+                    val results = tweetNodes.mapNotNull { rawNode ->
+                        var node = rawNode
                         if (node.path("__typename").asText() == "TweetWithVisibilityResults") {
                             node = node.path("tweet")
                         }
