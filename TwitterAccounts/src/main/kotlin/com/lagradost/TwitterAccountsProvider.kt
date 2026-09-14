@@ -56,7 +56,7 @@ class TwitterAccountsProvider : MainAPI() {
         val (authToken, ct0) = authCookies() ?: return null
 
         // TODO: replace with the real queryId from DevTools (UserByScreenName)
-        val queryId = "USER_BY_SCREEN_NAME_QUERY_ID"
+        val queryId = "KybxDj9RrADIITXlGG8kpw"
         val variables = "{\"screen_name\":\"$username\",\"withSafetyModeUserFields\":true}"
         val url = "https://x.com/i/api/graphql/$queryId/UserByScreenName" +
                 "?variables=" + URLEncoder.encode(variables, "UTF-8")
@@ -78,7 +78,7 @@ class TwitterAccountsProvider : MainAPI() {
         val userId = resolveUserId(username) ?: return emptyList()
 
         // TODO: replace with the real queryId from DevTools (UserMedia)
-        val queryId = "USER_MEDIA_QUERY_ID"
+        val queryId = "atLYUUmER14HCLFnNUKJgA"
         val variables = "{\"userId\":\"$userId\",\"count\":$perPage,\"includePromotedContent\":false," +
                 "\"withClientEventToken\":false,\"withBirdwatchNotes\":false,\"withVoice\":true}"
         val url = "https://x.com/i/api/graphql/$queryId/UserMedia" +
