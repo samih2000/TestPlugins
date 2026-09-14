@@ -58,7 +58,7 @@ class TwitterAccountsProvider : MainAPI() {
             val json = app.get(url, headers = authHeaders(ct0, authToken)).text
             val root = mapper.readTree(json)
             val id = root.path("data").path("user").path("result").path("rest_id").asText(null)
-            if (id != null) id to "" else null to "Parsed OK but no rest_id. Raw: ${json.take(1500)}"
+            if (id != null) id to "" else null to "Parsed OK but no rest_id. Raw: ${json.take(4000)}"
         } catch (e: Exception) {
             null to "Request failed: ${e.message}"
         }
@@ -81,7 +81,7 @@ class TwitterAccountsProvider : MainAPI() {
                     .path("timeline_v2").path("timeline").path("instructions")
 
                 if (instructions.isMissingNode || !instructions.isArray) {
-                    emptyList<SearchResponse>() to "No instructions array found. Raw: ${json.take(1500)}"
+                    emptyList<SearchResponse>() to "No instructions array found. Raw: ${json.take(4000)}"
                 } else {
                     val entries = instructions.flatMap { instr ->
                         if (instr.path("type").asText() == "TimelineAddEntries") instr.path("entries").toList()
@@ -107,7 +107,7 @@ class TwitterAccountsProvider : MainAPI() {
                     }
 
                     if (results.isEmpty())
-                        results to "Got ${entries.size} entries but 0 had media. Raw: ${json.take(1500)}"
+                        results to "Got ${entries.size} entries but 0 had media. Raw: ${json.take(4000)}"
                     else
                         results to ""
                 }
