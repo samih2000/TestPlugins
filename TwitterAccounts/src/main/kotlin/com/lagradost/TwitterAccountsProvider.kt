@@ -168,8 +168,23 @@ class TwitterAccountsProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> = emptyList()
 
     override suspend fun load(url: String): LoadResponse {
-        return newMovieLoadResponse(url, url, TvType.Movie, url)
-    }
+        if (url.contains("/debug/")) {
+            val debugUsername = url.substringAfterLast("/debug/").substringBefore("?")
+            val (userId, userIdDebug) = resolveUserId(debugUsername)
+            val fullDebugText = if (userId == null) {
+                "url received: $url\nparsed username: $debugUsername\n\nuserId lookup failed:\n\n$userIdDebug"
+            } else {
+                val (_, mediaDebug) = fetchUserMedia(debugUsername, userId, 12)
+                "url received: $url\nparsed username: $debugUsername\nuserId = $userId\n\nmedia fetch result:\n\n$mediaDebug"
+            }
+            return newMovieLoadResponse("Debug: $debugUsername", url, TvType.Movie, url) {
+                this.plot = fullDebugText
+            }
+        }
+
+        return newMovieLoadResponse(url, url, TvType.Movie, url) {
+            this.plot = "NON-DEBUG PATH — url was: $url"
+        }
 
     override suspend fun loadLinks(
         data: String,
