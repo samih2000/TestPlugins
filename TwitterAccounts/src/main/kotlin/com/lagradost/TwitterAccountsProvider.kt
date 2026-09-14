@@ -185,6 +185,7 @@ class TwitterAccountsProvider : MainAPI() {
         return newMovieLoadResponse(url, url, TvType.Movie, url) {
             this.plot = "NON-DEBUG PATH — url was: $url"
         }
+    }
 
     override suspend fun loadLinks(
         data: String,
