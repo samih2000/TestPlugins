@@ -197,15 +197,21 @@ class RaindropProvider : MainAPI() {
         return VxTweet(media_extended = listOf(merged), mediaURLs = vx?.mediaURLs)
     }
 
+    private fun cleanTitle(raw: String?): String? {
+    if (raw.isNullOrBlank()) return null
+    val cleaned = raw.replace(Regex("https?://\\S+"), "").trim()
+    return cleaned.ifBlank { null }
+    }
+    
     private suspend fun RaindropItem.toSearchResponse(provider: MainAPI): SearchResponse {
         val poster = fetchTweetMedia(link)?.media_extended?.firstOrNull()?.thumbnail_url
             ?: cover?.takeIf { it.isNotBlank() }
 
         return provider.newMovieSearchResponse(
-            title ?: link,
-            link,
-            TvType.Movie
-        ) {
+    cleanTitle(title) ?: link,
+    link,
+    TvType.Movie
+) {
             this.posterUrl = poster
         }
     }
@@ -292,7 +298,7 @@ class RaindropProvider : MainAPI() {
             ?: item?.cover?.takeIf { it.isNotBlank() }
 
         return newMovieLoadResponse(
-            item?.title ?: url,
+            cleanTitle(item?.title) ?: url,
             url,
             TvType.Movie,
             url
