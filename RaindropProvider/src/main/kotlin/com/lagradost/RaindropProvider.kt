@@ -200,17 +200,22 @@ class RaindropProvider : MainAPI() {
     private val badTitle = Regex("age[- ]?restricted", RegexOption.IGNORE_CASE)
 
 private fun cleanTitle(raw: String?): String? {
-    if (raw.isNullOrBlank() || badTitle.containsMatchIn(raw)) return null
-    val cleaned = raw.replace(Regex("https?://\\S+"), "").trim()
-    return cleaned.ifBlank { null }
-}
+        if (raw.isNullOrBlank() || badTitle.containsMatchIn(raw)) return null
+        val cleaned = raw.replace(Regex("https?://\\S+"), "").trim()
+        return cleaned.ifBlank { null }
+    }
+
+    private fun fallbackTitle(url: String): String {
+        val m = Regex("(?:x|twitter)\\.com/([^/]+)/status/").find(url)
+        return m?.let { "@${it.groupValues[1]}" } ?: url
+    }
     
     private suspend fun RaindropItem.toSearchResponse(provider: MainAPI): SearchResponse {
         val poster = fetchTweetMedia(link)?.media_extended?.firstOrNull()?.thumbnail_url
             ?: cover?.takeIf { it.isNotBlank() }
 
         return provider.newMovieSearchResponse(
-    cleanTitle(title) ?: link,
+    cleanTitle(title) ?: fallbackTitle(link),
     link,
     TvType.Movie
 ) {
@@ -300,7 +305,7 @@ private fun cleanTitle(raw: String?): String? {
             ?: item?.cover?.takeIf { it.isNotBlank() }
 
         return newMovieLoadResponse(
-            cleanTitle(item?.title) ?: url,
+            cleanTitle(item?.title) ?: fallbackTitle(url),
             url,
             TvType.Movie,
             url
