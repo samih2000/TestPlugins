@@ -257,10 +257,17 @@ class RaindropProvider : MainAPI() {
     private fun pickTitle(raindropTitle: String?, tweetText: String?, url: String): String =
         cleanTitle(raindropTitle) ?: cleanTitle(tweetText) ?: fallbackTitle(url)
 
+    // For tweet links, Raindrop's cover is usually a screenshot of X's error/login page
+    // ("Not found", "Read more on X"), so only use it for non-tweet links.
+    private fun posterFor(link: String, tweet: VxTweet?, cover: String?): String? {
+        val thumb = tweet?.media_extended?.firstOrNull()?.thumbnail_url?.takeIf { it.isNotBlank() }
+        if (thumb != null) return thumb
+        return if (tweetRegex.containsMatchIn(link)) null else cover?.takeIf { it.isNotBlank() }
+    }
+
     private suspend fun RaindropItem.toSearchResponse(provider: MainAPI): SearchResponse {
         val tweet = fetchTweetMedia(link)
-        val poster = tweet?.media_extended?.firstOrNull()?.thumbnail_url
-            ?: cover?.takeIf { it.isNotBlank() }
+        val poster = posterFor(link, tweet, cover)
 
         return provider.newMovieSearchResponse(
             pickTitle(title, tweet?.text, link),
@@ -368,8 +375,7 @@ class RaindropProvider : MainAPI() {
         val item = findRaindropItem(url)
         val tweet = fetchTweetMedia(url)
 
-        val poster = tweet?.media_extended?.firstOrNull()?.thumbnail_url
-            ?: item?.cover?.takeIf { it.isNotBlank() }
+        val poster = posterFor(url, tweet, item?.cover)
 
         return newMovieLoadResponse(
             pickTitle(item?.title, tweet?.text, url),
