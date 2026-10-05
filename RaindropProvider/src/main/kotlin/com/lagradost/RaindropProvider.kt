@@ -197,11 +197,13 @@ class RaindropProvider : MainAPI() {
         return VxTweet(media_extended = listOf(merged), mediaURLs = vx?.mediaURLs)
     }
 
-    private fun cleanTitle(raw: String?): String? {
-    if (raw.isNullOrBlank()) return null
+    private val badTitle = Regex("age[- ]?restricted", RegexOption.IGNORE_CASE)
+
+private fun cleanTitle(raw: String?): String? {
+    if (raw.isNullOrBlank() || badTitle.containsMatchIn(raw)) return null
     val cleaned = raw.replace(Regex("https?://\\S+"), "").trim()
     return cleaned.ifBlank { null }
-    }
+}
     
     private suspend fun RaindropItem.toSearchResponse(provider: MainAPI): SearchResponse {
         val poster = fetchTweetMedia(link)?.media_extended?.firstOrNull()?.thumbnail_url
