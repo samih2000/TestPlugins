@@ -1,6 +1,7 @@
 package com.lagradost
 
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import com.lagradost.cloudstream3.*
@@ -25,7 +26,9 @@ class RaindropProvider : MainAPI() {
     override var lang = "en"
     override val supportedTypes = setOf(TvType.Others)
 
+    // Ignore unknown fields: vxtwitter returns many fields we don't declare.
     private val mapper = jacksonObjectMapper()
+        .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
 
     private val raindropToken: String
         get() = com.lagradost.cloudstream3.CloudStreamApp.context
@@ -60,7 +63,28 @@ class RaindropProvider : MainAPI() {
     )
 
     data class VxMedia(val type: String?, val url: String?, val thumbnail_url: String?)
-    data class VxTweet(val media_extended: List<VxMedia>?, val mediaURLs: List<String>?)
+    data class VxTweet(
+        val media_extended: List<VxMedia>?,
+        val mediaURLs: List<String>?,
+        val text: String? = null
+    )
+
+    // ---------- Link handling (inspired by Piko's "Clear tracking params" / "Handle custom links") ----------
+
+    // Accepts x.com, twitter.com and the common embed-fixer domains.
+    private val tweetRegex =
+        Regex("(?:x|twitter|vxtwitter|fxtwitter|fixupx|fixvx)\\.com/([^/?#]+)/status/(\\d+)")
+
+    private fun tweetIdOf(url: String): String? =
+        tweetRegex.find(url)?.groupValues?.get(2)
+
+    // https://vxtwitter.com/user/status/123?s=20&t=abc  ->  https://x.com/user/status/123
+    private fun normalizeTweetUrl(url: String): String {
+        val m = tweetRegex.find(url) ?: return url
+        return "https://x.com/${m.groupValues[1]}/status/${m.groupValues[2]}"
+    }
+
+    // ---------- Tweet fetching ----------
 
     private suspend fun fetchVxTweet(username: String, tweetId: String): VxTweet? {
         vxCacheMutex.withLock {
@@ -140,12 +164,14 @@ class RaindropProvider : MainAPI() {
                 if (tweetNode.path("__typename").asText() == "TweetWithVisibilityResults") {
                     tweetNode = tweetNode.path("tweet")
                 }
-                val mediaList = tweetNode.path("legacy").path("extended_entities").path("media")
+                val legacy = tweetNode.path("legacy")
+                val text = legacy.path("full_text").asText(null)?.takeIf { it.isNotBlank() }
+                val mediaList = legacy.path("extended_entities").path("media")
 
-                if (!mediaList.isArray || mediaList.isEmpty) {
+                val mediaExtended = if (!mediaList.isArray || mediaList.isEmpty) {
                     null
                 } else {
-                    val mediaExtended = mediaList.mapNotNull { media ->
+                    mediaList.mapNotNull { media ->
                         val type = media.path("type").asText()
                         val thumb = media.path("media_url_https").asText(null)
                         if (type != "video" && type != "animated_gif") {
@@ -161,9 +187,11 @@ class RaindropProvider : MainAPI() {
                             url = bestUrl,
                             thumbnail_url = thumb
                         )
-                    }
-                    if (mediaExtended.isEmpty()) null else VxTweet(mediaExtended, null)
+                    }.ifEmpty { null }
                 }
+
+                if (mediaExtended == null && text == null) null
+                else VxTweet(mediaExtended, null, text)
             } catch (e: Exception) {
                 null
             }
@@ -176,15 +204,17 @@ class RaindropProvider : MainAPI() {
     }
 
     private suspend fun fetchTweetMedia(tweetUrl: String): VxTweet? {
-        val match = Regex("(?:x|twitter)\\.com/([^/]+)/status/(\\d+)").find(tweetUrl) ?: return null
+        val match = tweetRegex.find(tweetUrl) ?: return null
         val (username, tweetId) = match.destructured
 
         val vx = fetchVxTweet(username, tweetId)
         val vxMedia = vx?.media_extended?.firstOrNull()
         val hasThumb = !vxMedia?.thumbnail_url.isNullOrBlank()
         val hasVideo = !vxMedia?.url.isNullOrBlank()
-        if (hasThumb && hasVideo) return vx
+        val hasText = !vx?.text.isNullOrBlank()
+        if (hasThumb && hasVideo && hasText) return vx
 
+        // Fall back to the authenticated X API for anything vxtwitter couldn't provide.
         val auth = fetchAuthenticatedTweet(tweetId)
         val authMedia = auth?.media_extended?.firstOrNull()
 
@@ -193,35 +223,55 @@ class RaindropProvider : MainAPI() {
             url = vxMedia?.url?.takeIf { it.isNotBlank() } ?: authMedia?.url,
             thumbnail_url = vxMedia?.thumbnail_url?.takeIf { it.isNotBlank() } ?: authMedia?.thumbnail_url
         )
-        if (merged.url == null && merged.thumbnail_url == null) return null
-        return VxTweet(media_extended = listOf(merged), mediaURLs = vx?.mediaURLs)
+        val text = vx?.text?.takeIf { it.isNotBlank() } ?: auth?.text
+        val mediaList = if (merged.url == null && merged.thumbnail_url == null) null else listOf(merged)
+
+        if (mediaList == null && text == null) return null
+        return VxTweet(media_extended = mediaList, mediaURLs = vx?.mediaURLs, text = text)
     }
 
-    private val badTitle = Regex("age[- ]?restricted", RegexOption.IGNORE_CASE)
+    // ---------- Titles ----------
 
-private fun cleanTitle(raw: String?): String? {
+    // Junk titles Raindrop saves when X is login-walled / age-restricted.
+    private val badTitle = Regex(
+        "age[- ]?restricted|^\\s*(x|twitter|post|x\\s*\\(formerly twitter\\))\\s*$",
+        RegexOption.IGNORE_CASE
+    )
+
+    private fun cleanTitle(raw: String?, maxLen: Int = 80): String? {
         if (raw.isNullOrBlank() || badTitle.containsMatchIn(raw)) return null
-        val cleaned = raw.replace(Regex("https?://\\S+"), "").trim()
-        return cleaned.ifBlank { null }
+        val cleaned = raw
+            .replace(Regex("https?://\\S+"), "")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        if (cleaned.isBlank()) return null
+        return if (cleaned.length > maxLen) cleaned.take(maxLen - 1).trimEnd() + "…" else cleaned
     }
 
     private fun fallbackTitle(url: String): String {
-        val m = Regex("(?:x|twitter)\\.com/([^/]+)/status/").find(url)
+        val m = tweetRegex.find(url)
         return m?.let { "@${it.groupValues[1]}" } ?: url
     }
-    
+
+    // Raindrop title -> tweet text -> @username
+    private fun pickTitle(raindropTitle: String?, tweetText: String?, url: String): String =
+        cleanTitle(raindropTitle) ?: cleanTitle(tweetText) ?: fallbackTitle(url)
+
     private suspend fun RaindropItem.toSearchResponse(provider: MainAPI): SearchResponse {
-        val poster = fetchTweetMedia(link)?.media_extended?.firstOrNull()?.thumbnail_url
+        val tweet = fetchTweetMedia(link)
+        val poster = tweet?.media_extended?.firstOrNull()?.thumbnail_url
             ?: cover?.takeIf { it.isNotBlank() }
 
         return provider.newMovieSearchResponse(
-    cleanTitle(title) ?: fallbackTitle(link),
-    link,
-    TvType.Movie
-) {
+            pickTitle(title, tweet?.text, link),
+            link,
+            TvType.Movie
+        ) {
             this.posterUrl = poster
         }
     }
+
+    // ---------- Raindrop shelves ----------
 
     private suspend fun fetchShelf(searchQuery: String?, perPage: Int): List<SearchResponse> = coroutineScope {
         val q = searchQuery?.let { "&search=" + URLEncoder.encode(it, "UTF-8") } ?: ""
@@ -272,40 +322,57 @@ private fun cleanTitle(raw: String?): String? {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-    val topTags = fetchTopTags(topN = 6)
+        val topTags = fetchTopTags(topN = 6)
 
-    val lists = coroutineScope {
-        val recentDeferred = async { HomePageList("Recently Added", fetchShelf(null, 8)) }
-        val randomDeferred = async { HomePageList("Random Picks", fetchRandomShelf(8)) }
+        val lists = coroutineScope {
+            val recentDeferred = async { HomePageList("Recently Added", fetchShelf(null, 8)) }
+            val randomDeferred = async { HomePageList("Random Picks", fetchRandomShelf(8)) }
 
-        val tagDeferreds = topTags.map { tagName ->
-            async {
-                val items = fetchShelf("#$tagName", 8)
-                if (items.isEmpty()) null else HomePageList(tagName, items)
+            val tagDeferreds = topTags.map { tagName ->
+                async {
+                    val items = fetchShelf("#$tagName", 8)
+                    if (items.isEmpty()) null else HomePageList(tagName, items)
+                }
             }
+
+            listOf(recentDeferred.await(), randomDeferred.await()) + tagDeferreds.awaitAll().filterNotNull()
         }
 
-        listOf(recentDeferred.await(), randomDeferred.await()) + tagDeferreds.awaitAll().filterNotNull()
+        return newHomePageResponse(list = lists, hasNext = false)
     }
-
-    return newHomePageResponse(list = lists, hasNext = false)
-}
 
     override suspend fun search(query: String): List<SearchResponse> {
         return fetchShelf(query, 50)
     }
 
-    override suspend fun load(url: String): LoadResponse {
-        val q = URLEncoder.encode(url, "UTF-8")
-        val res = app.get("$mainUrl/rest/v1/raindrops/0?search=$q", headers = authHeaders())
-            .parsedSafe<RaindropListResponse>()
-        val item = res?.items?.firstOrNull()
+    private suspend fun findRaindropItem(url: String): RaindropItem? {
+        suspend fun query(term: String): RaindropItem? {
+            val q = URLEncoder.encode(term, "UTF-8")
+            return app.get("$mainUrl/rest/v1/raindrops/0?search=$q", headers = authHeaders())
+                .parsedSafe<RaindropListResponse>()
+                ?.items
+                ?.firstOrNull()
+        }
 
-        val poster = fetchTweetMedia(url)?.media_extended?.firstOrNull()?.thumbnail_url
+        // Search by tweet ID first so tracking params / alternate domains don't break the match,
+        // then fall back to the full URL.
+        val id = tweetIdOf(url)
+        if (id != null) {
+            val byId = query(id)
+            if (byId != null && tweetIdOf(byId.link) == id) return byId
+        }
+        return query(url)
+    }
+
+    override suspend fun load(url: String): LoadResponse {
+        val item = findRaindropItem(url)
+        val tweet = fetchTweetMedia(url)
+
+        val poster = tweet?.media_extended?.firstOrNull()?.thumbnail_url
             ?: item?.cover?.takeIf { it.isNotBlank() }
 
         return newMovieLoadResponse(
-            cleanTitle(item?.title) ?: fallbackTitle(url),
+            pickTitle(item?.title, tweet?.text, url),
             url,
             TvType.Movie,
             url
