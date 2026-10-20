@@ -1,6 +1,9 @@
 package com.lagradost
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.widget.Toast
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
@@ -11,12 +14,16 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
@@ -63,6 +70,14 @@ class RaindropProvider : MainAPI() {
     private val tweetMissTtlMs = 10L * 60L * 1000L
     private val tweetCacheMaxEntries = 1500
 
+    // A tile waits at most this long for its tweet lookup. A slow lookup keeps running in the
+    // background and fills the cache, so the tile shows its thumbnail on the next load.
+    private val tileFetchTimeoutMs = 6_000L
+
+    // While diagnosing slow thumbnails: shows a short toast when a shelf has tiles without a
+    // thumbnail, with the most recent failure reason. Set to false to silence it.
+    private val debugToasts = true
+
     // Ignore unknown fields: vxtwitter returns many fields we don't declare.
     private val mapper = jacksonObjectMapper()
         .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
@@ -84,6 +99,21 @@ class RaindropProvider : MainAPI() {
     private val tweetMemCache = ConcurrentHashMap<String, Pair<Long, VxTweet>>()
     // tweetId -> time of the last complete failure.
     private val tweetMissCache = ConcurrentHashMap<String, Long>()
+
+    // Lookups run in their own scope so a tile that stops waiting doesn't cancel them.
+    // Also means two tiles asking for the same tweet share one request.
+    private val fetchScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val inFlight = ConcurrentHashMap<String, Deferred<VxTweet?>>()
+
+    @Volatile
+    private var lastFailure: String? = null
+
+    private fun debugToast(message: String) {
+        val ctx = com.lagradost.cloudstream3.CloudStreamApp.context ?: return
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(ctx, message, Toast.LENGTH_LONG).show()
+        }
+    }
 
     data class RaindropItem(
         @JsonProperty("_id") val id: Long,
@@ -207,12 +237,18 @@ class RaindropProvider : MainAPI() {
     private suspend fun fetchVxTweet(username: String, tweetId: String): VxTweet? =
         vxSemaphore.withPermit {
             val fetched = try {
-                val json = app.get(
+                val res = app.get(
                     "https://api.vxtwitter.com/$username/status/$tweetId",
                     headers = mapOf("User-Agent" to "Mozilla/5.0")
-                ).text
-                mapper.readValue<VxTweet>(json)
+                )
+                if (res.code == 200) {
+                    mapper.readValue<VxTweet>(res.text)
+                } else {
+                    lastFailure = "vxtwitter HTTP ${res.code}"
+                    null
+                }
             } catch (e: Exception) {
+                lastFailure = "vxtwitter ${e.javaClass.simpleName}"
                 null
             }
             delay(vxDelayMs)
@@ -266,7 +302,9 @@ class RaindropProvider : MainAPI() {
                     "User-Agent" to "Mozilla/5.0"
                 )
 
-                val json = app.get(url, headers = headers).text
+                val res = app.get(url, headers = headers)
+                if (res.code != 200) lastFailure = "X API HTTP ${res.code}"
+                val json = res.text
                 val root = mapper.readTree(json)
                 var tweetNode = root.path("data").path("tweetResult").path("result")
                 if (tweetNode.path("__typename").asText() == "TweetWithVisibilityResults") {
@@ -301,6 +339,7 @@ class RaindropProvider : MainAPI() {
                 if (mediaExtended == null && text == null) null
                 else VxTweet(mediaExtended, null, text)
             } catch (e: Exception) {
+                lastFailure = "X API ${e.javaClass.simpleName}"
                 null
             }
             delay(twDelayMs)
@@ -340,18 +379,28 @@ class RaindropProvider : MainAPI() {
 
         readCachedTweet(tweetId)?.let { return it }
 
-        val now = System.currentTimeMillis()
         val lastMiss = tweetMissCache[tweetId]
-        if (lastMiss != null && now - lastMiss < tweetMissTtlMs) return null
+        if (lastMiss != null && System.currentTimeMillis() - lastMiss < tweetMissTtlMs) return null
 
-        val result = fetchTweetMediaFromNetwork(username, tweetId)
-        if (result != null) {
-            tweetMissCache.remove(tweetId)
-            writeCachedTweet(tweetId, result)
-        } else {
-            tweetMissCache[tweetId] = now
+        // Lazy so a duplicate created by a race is simply never started.
+        val job = inFlight.getOrPut(tweetId) {
+            fetchScope.async(start = CoroutineStart.LAZY) {
+                try {
+                    val result = fetchTweetMediaFromNetwork(username, tweetId)
+                    if (result != null) {
+                        tweetMissCache.remove(tweetId)
+                        writeCachedTweet(tweetId, result)
+                    } else {
+                        tweetMissCache[tweetId] = System.currentTimeMillis()
+                    }
+                    result
+                } finally {
+                    inFlight.remove(tweetId)
+                }
+            }
         }
-        return result
+        job.start()
+        return job.await()
     }
 
     // ---------- Titles ----------
@@ -390,7 +439,15 @@ class RaindropProvider : MainAPI() {
     }
 
     private suspend fun RaindropItem.toSearchResponse(provider: MainAPI): SearchResponse {
-        val tweet = fetchTweetMedia(link)
+        // Don't let one slow tweet hold up the whole shelf. If it times out, the lookup keeps
+        // running in the background and the result is cached for the next load.
+        val tweet = withTimeoutOrNull(tileFetchTimeoutMs) { fetchTweetMedia(link) }
+        if (tweet == null) {
+            val id = tweetIdOf(link)
+            if (id != null && inFlight.containsKey(id)) {
+                lastFailure = "lookups slower than ${tileFetchTimeoutMs / 1000}s"
+            }
+        }
         val poster = posterFor(link, tweet, cover)
 
         return provider.newMovieSearchResponse(
@@ -403,7 +460,17 @@ class RaindropProvider : MainAPI() {
     }
 
     private suspend fun List<RaindropItem>.toSearchResponses(): List<SearchResponse> = coroutineScope {
-        map { async { it.toSearchResponse(this@RaindropProvider) } }.awaitAll()
+        val responses = map { async { it.toSearchResponse(this@RaindropProvider) } }.awaitAll()
+        if (debugToasts) {
+            val missing = responses.count { it.posterUrl == null }
+            if (missing > 0) {
+                debugToast(
+                    "Raindrop: $missing/${responses.size} tiles without thumbnail" +
+                            (lastFailure?.let { " ($it)" } ?: "")
+                )
+            }
+        }
+        responses
     }
 
     // ---------- Raindrop shelves ----------
