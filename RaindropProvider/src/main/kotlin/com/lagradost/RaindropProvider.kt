@@ -81,7 +81,7 @@ class RaindropProvider : MainAPI() {
 
     // While diagnosing slow thumbnails: shows a short toast when a shelf has tiles without a
     // thumbnail, with the most recent failure reason. Set to false to silence it.
-    private val debugToasts = false
+    private val debugToasts = true
 
     // Ignore unknown fields: vxtwitter returns many fields we don't declare.
     private val mapper = jacksonObjectMapper()
@@ -560,7 +560,7 @@ class RaindropProvider : MainAPI() {
             if (missing > 0) {
                 val reasons = failureCounts.entries
                     .sortedByDescending { it.value.get() }
-                    .take(3)
+                    .take(5)
                     .joinToString(", ") { "${it.key} x${it.value.get()}" }
                 failureCounts.clear()
                 debugToast(
