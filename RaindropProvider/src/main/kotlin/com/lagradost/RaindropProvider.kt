@@ -81,7 +81,7 @@ class RaindropProvider : MainAPI() {
 
     // While diagnosing slow thumbnails: shows a short toast when a shelf has tiles without a
     // thumbnail, with the most recent failure reason. Set to false to silence it.
-    private val debugToasts = true
+    private val debugToasts = false
 
     // Ignore unknown fields: vxtwitter returns many fields we don't declare.
     private val mapper = jacksonObjectMapper()
