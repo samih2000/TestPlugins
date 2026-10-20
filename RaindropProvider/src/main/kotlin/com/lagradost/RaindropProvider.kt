@@ -30,6 +30,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 class RaindropProvider : MainAPI() {
     override var mainUrl = "https://api.raindrop.io"
@@ -70,6 +71,10 @@ class RaindropProvider : MainAPI() {
     private val tweetMissTtlMs = 10L * 60L * 1000L
     private val tweetCacheMaxEntries = 1500
 
+    // Each single request to vxtwitter / FxTwitter / X gives up after this many seconds, so a
+    // hung connection can't hold one of the lookup slots for 30+ seconds.
+    private val lookupTimeoutSec = 8L
+
     // A tile waits at most this long for its tweet lookup. A slow lookup keeps running in the
     // background and fills the cache, so the tile shows its thumbnail on the next load.
     private val tileFetchTimeoutMs = 10_000L
@@ -107,8 +112,15 @@ class RaindropProvider : MainAPI() {
     private val fetchScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val inFlight = ConcurrentHashMap<String, Deferred<VxTweet?>>()
 
+    // Every failure reason that gets recorded is also counted, for the debug toast.
+    private val failureCounts = ConcurrentHashMap<String, AtomicInteger>()
+
     @Volatile
     private var lastFailure: String? = null
+        set(value) {
+            field = value
+            if (value != null) failureCounts.getOrPut(value) { AtomicInteger() }.incrementAndGet()
+        }
 
     private fun debugToast(message: String) {
         val ctx = com.lagradost.cloudstream3.CloudStreamApp.context ?: return
@@ -259,11 +271,11 @@ class RaindropProvider : MainAPI() {
             if (System.currentTimeMillis() < vxBlockedUntil) return@withPermit null
             val fetched = try {
                 val vxUrl = "https://api.vxtwitter.com/$username/status/$tweetId"
-                var res = app.get(vxUrl, headers = browserHeaders)
+                var res = app.get(vxUrl, headers = browserHeaders, timeout = lookupTimeoutSec)
                 if (res.code == 429) {
                     // Rate limited: back off once and try again.
                     delay(1500)
-                    res = app.get(vxUrl, headers = browserHeaders)
+                    res = app.get(vxUrl, headers = browserHeaders, timeout = lookupTimeoutSec)
                 }
                 if (res.code == 200) {
                     mapper.readValue<VxTweet>(res.text)
@@ -289,7 +301,8 @@ class RaindropProvider : MainAPI() {
             val fetched = try {
                 val res = app.get(
                     "https://api.fxtwitter.com/$username/status/$tweetId",
-                    headers = browserHeaders
+                    headers = browserHeaders,
+                    timeout = lookupTimeoutSec
                 )
                 if (res.code != 200) {
                     lastFailure = "fxtwitter HTTP ${res.code}"
@@ -376,7 +389,7 @@ class RaindropProvider : MainAPI() {
                     "User-Agent" to "Mozilla/5.0"
                 )
 
-                val res = app.get(url, headers = headers)
+                val res = app.get(url, headers = headers, timeout = lookupTimeoutSec)
                 if (res.code != 200) lastFailure = "X API HTTP ${res.code}"
                 val json = res.text
                 val root = mapper.readTree(json)
@@ -545,9 +558,15 @@ class RaindropProvider : MainAPI() {
         if (debugToasts) {
             val missing = responses.count { it.posterUrl == null }
             if (missing > 0) {
+                val reasons = failureCounts.entries
+                    .sortedByDescending { it.value.get() }
+                    .take(3)
+                    .joinToString(", ") { "${it.key} x${it.value.get()}" }
+                failureCounts.clear()
                 debugToast(
-                    "Raindrop: $missing/${responses.size} tiles without thumbnail" +
-                            (lastFailure?.let { " ($it)" } ?: "")
+                    "Raindrop: $missing/${responses.size} tiles without thumbnail " +
+                            if (reasons.isNotEmpty()) "[$reasons]"
+                            else "[no errors: lookups answered but had no thumbnail]"
                 )
             }
         }
