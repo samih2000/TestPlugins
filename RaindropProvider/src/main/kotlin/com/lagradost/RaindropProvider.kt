@@ -9,10 +9,13 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
@@ -25,6 +28,21 @@ class RaindropProvider : MainAPI() {
     override val hasMainPage = true
     override var lang = "en"
     override val supportedTypes = setOf(TvType.Others)
+
+    // ---------- Shelf layout ----------
+
+    // Tiles shown in the home row. Expanding a shelf loads one more page of the same size,
+    // so Random Picks and tag shelves go 16 -> 32 when expanded.
+    private val shelfRowSize = 16
+    private val shelfMaxPages = 2
+    private val recentShelfSize = 8
+    private val tagShelfCount = 6
+    private val tagMinCount = 3
+    private val tagPoolMax = 100
+    private val tagPoolTtlMs = 60L * 60L * 1000L
+
+    private val tagPoolKey = "tag_pool_json"
+    private val tagPoolTsKey = "tag_pool_ts"
 
     // Ignore unknown fields: vxtwitter returns many fields we don't declare.
     private val mapper = jacksonObjectMapper()
@@ -61,6 +79,13 @@ class RaindropProvider : MainAPI() {
         val items: List<RaindropItem>,
         val count: Int
     )
+
+    data class RaindropTag(
+        @JsonProperty("_id") val id: String,
+        val count: Int
+    )
+
+    data class RaindropTagsResponse(val items: List<RaindropTag>)
 
     data class VxMedia(val type: String?, val url: String?, val thumbnail_url: String?)
     data class VxTweet(
@@ -278,74 +303,164 @@ class RaindropProvider : MainAPI() {
         }
     }
 
+    private suspend fun List<RaindropItem>.toSearchResponses(): List<SearchResponse> = coroutineScope {
+        map { async { it.toSearchResponse(this@RaindropProvider) } }.awaitAll()
+    }
+
     // ---------- Raindrop shelves ----------
 
-    private suspend fun fetchShelf(searchQuery: String?, perPage: Int): List<SearchResponse> = coroutineScope {
+    // pageIndex is Raindrop's own 0-based page number.
+    private suspend fun fetchShelf(
+        searchQuery: String?,
+        perPage: Int,
+        pageIndex: Int = 0
+    ): List<SearchResponse> {
         val q = searchQuery?.let { "&search=" + URLEncoder.encode(it, "UTF-8") } ?: ""
         val res = app.get(
-            "$mainUrl/rest/v1/raindrops/0?sort=-created&perpage=$perPage$q",
+            "$mainUrl/rest/v1/raindrops/0?sort=-created&perpage=$perPage&page=$pageIndex$q",
             headers = authHeaders()
         ).parsedSafe<RaindropListResponse>()
 
-        res?.items?.map { async { it.toSearchResponse(this@RaindropProvider) } }?.awaitAll()
-            ?: emptyList()
+        return res?.items?.toSearchResponses() ?: emptyList()
     }
 
-    private suspend fun fetchRandomShelf(perPage: Int = 12): List<SearchResponse> = coroutineScope {
-        val countRes = app.get("$mainUrl/rest/v1/raindrops/0?perpage=1", headers = authHeaders())
-            .parsedSafe<RaindropListResponse>()
-        val total = countRes?.count ?: 0
+    // Random Picks: one shuffled pool of (row size x max pages) bookmarks, built when the home page
+    // loads. Expanding the shelf reads the next slice of the SAME pool, so page 2 never repeats page 1.
+    private var randomPool: List<RaindropItem> = emptyList()
+    private val randomPoolMutex = Mutex()
+
+    private suspend fun buildRandomPool(): List<RaindropItem> = coroutineScope {
+        val pageSize = 50 // Raindrop's maximum per request
+        val total = app.get("$mainUrl/rest/v1/raindrops/0?perpage=1", headers = authHeaders())
+            .parsedSafe<RaindropListResponse>()?.count ?: 0
         if (total == 0) return@coroutineScope emptyList()
 
-        val pageSize = 50
         val totalPages = ((total - 1) / pageSize) + 1
-        val randomPage = (0 until totalPages).random()
+        // Two distinct random pages: more variety, and the last partial page still gets picked sometimes.
+        val pages = (0 until totalPages).shuffled().take(2)
 
-        val res = app.get(
-            "$mainUrl/rest/v1/raindrops/0?perpage=$pageSize&page=$randomPage",
-            headers = authHeaders()
-        ).parsedSafe<RaindropListResponse>()
-
-        res?.items?.shuffled()?.take(perPage)
-            ?.map { async { it.toSearchResponse(this@RaindropProvider) } }?.awaitAll()
-            ?: emptyList()
-    }
-
-    private suspend fun fetchTopTags(sampleSize: Int = 200, topN: Int = 10): List<String> {
-        val res = app.get(
-            "$mainUrl/rest/v1/raindrops/0?perpage=$sampleSize&sort=-created",
-            headers = authHeaders()
-        ).parsedSafe<RaindropListResponse>()
-
-        return res?.items
-            ?.flatMap { it.tags ?: emptyList() }
-            ?.groupingBy { it }
-            ?.eachCount()
-            ?.entries
-            ?.sortedByDescending { it.value }
-            ?.take(topN)
-            ?.map { it.key }
-            ?: emptyList()
-    }
-
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val topTags = fetchTopTags(topN = 6)
-
-        val lists = coroutineScope {
-            val recentDeferred = async { HomePageList("Recently Added", fetchShelf(null, 8)) }
-            val randomDeferred = async { HomePageList("Random Picks", fetchRandomShelf(8)) }
-
-            val tagDeferreds = topTags.map { tagName ->
-                async {
-                    val items = fetchShelf("#$tagName", 8)
-                    if (items.isEmpty()) null else HomePageList(tagName, items)
-                }
+        pages.map { p ->
+            async {
+                app.get(
+                    "$mainUrl/rest/v1/raindrops/0?perpage=$pageSize&page=$p",
+                    headers = authHeaders()
+                ).parsedSafe<RaindropListResponse>()?.items ?: emptyList()
             }
+        }.awaitAll()
+            .flatten()
+            .distinctBy { it.id }
+            .shuffled()
+            .take(shelfRowSize * shelfMaxPages)
+    }
 
-            listOf(recentDeferred.await(), randomDeferred.await()) + tagDeferreds.awaitAll().filterNotNull()
+    private suspend fun fetchRandomShelf(page: Int): List<SearchResponse> {
+        val pool = randomPoolMutex.withLock {
+            if (page <= 1 || randomPool.isEmpty()) randomPool = buildRandomPool()
+            randomPool
+        }
+        return pool.drop((page - 1) * shelfRowSize).take(shelfRowSize).toSearchResponses()
+    }
+
+    // ---------- Tag pool ----------
+    // The tag list is kept in SharedPreferences because `mainPage` is read synchronously
+    // (it has to know the shelf names before any request is made).
+
+    private fun readTagPool(): List<String> {
+        val ctx = com.lagradost.cloudstream3.CloudStreamApp.context ?: return emptyList()
+        val json = raindropPrefs(ctx).getString(tagPoolKey, null) ?: return emptyList()
+        return try {
+            mapper.readValue<List<String>>(json)
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    private suspend fun refreshTagPoolIfStale() {
+        val ctx = com.lagradost.cloudstream3.CloudStreamApp.context ?: return
+        if (raindropToken.isBlank()) return
+        val prefs = raindropPrefs(ctx)
+        val age = System.currentTimeMillis() - prefs.getLong(tagPoolTsKey, 0L)
+        if (readTagPool().isNotEmpty() && age < tagPoolTtlMs) return
+
+        val res = try {
+            app.get("$mainUrl/rest/v1/tags/0", headers = authHeaders())
+                .parsedSafe<RaindropTagsResponse>()
+        } catch (e: Exception) {
+            null
+        } ?: return
+
+        val names = res.items
+            .filter { it.count >= tagMinCount && it.id.isNotBlank() }
+            .sortedByDescending { it.count }
+            .map { it.id }
+            .take(tagPoolMax)
+        if (names.isEmpty()) return
+
+        prefs.edit()
+            .putString(tagPoolKey, mapper.writeValueAsString(names))
+            .putLong(tagPoolTsKey, System.currentTimeMillis())
+            .apply()
+    }
+
+    /** Called by the plugin at app start so the tag shelves exist by the time the home page opens. */
+    fun warmUp() {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                refreshTagPoolIfStale()
+            } catch (e: Exception) {
+                // best effort
+            }
+        }
+    }
+
+    // Which tag shelves to show right now (top tags for now).
+    private fun selectedTags(): List<String> = readTagPool().take(tagShelfCount)
+
+    private fun tagQuery(tag: String): String =
+        if (tag.any { it.isWhitespace() }) "#\"$tag\"" else "#$tag"
+
+    // ---------- Main page ----------
+
+    // One request per shelf, so CloudStream can paginate (expand) each shelf on its own.
+    // `data` -> `name` order is the CloudStream convention for mainPageOf.
+    override val mainPage: List<MainPageData>
+        get() {
+            val shelves = mutableListOf(
+                "recent" to "Recently Added",
+                "random" to "Random Picks"
+            )
+            selectedTags().forEach { tag -> shelves.add("tag:$tag" to tag) }
+            return mainPageOf(*shelves.toTypedArray())
         }
 
-        return newHomePageResponse(list = lists, hasNext = false)
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val data = request.data
+        return when {
+            data == "recent" -> {
+                refreshTagPoolIfStale()
+                newHomePageResponse(request.name, fetchShelf(null, recentShelfSize), false)
+            }
+
+            data == "random" -> {
+                val items = fetchRandomShelf(page)
+                newHomePageResponse(
+                    request.name,
+                    items,
+                    page < shelfMaxPages && items.size >= shelfRowSize
+                )
+            }
+
+            data.startsWith("tag:") -> {
+                val items = fetchShelf(tagQuery(data.removePrefix("tag:")), shelfRowSize, page - 1)
+                newHomePageResponse(
+                    request.name,
+                    items,
+                    page < shelfMaxPages && items.size >= shelfRowSize
+                )
+            }
+
+            else -> newHomePageResponse(request.name, emptyList<SearchResponse>(), false)
+        }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
