@@ -31,18 +31,22 @@ class RaindropProvider : MainAPI() {
 
     // ---------- Shelf layout ----------
 
-    // Tiles shown in the home row. Expanding a shelf loads one more page of the same size,
-    // so Random Picks and tag shelves go 16 -> 32 when expanded.
+    // Each shelf starts with one page of 16 tiles. CloudStream loads the next page when the
+    // row is swiped to its end or the expanded grid is scrolled to the bottom, up to
+    // shelfMaxPages pages (4 x 16 = 64 tiles).
     private val shelfRowSize = 16
-    private val shelfMaxPages = 2
+    private val shelfMaxPages = 4
     private val recentShelfSize = 8
     private val tagShelfCount = 6
-    private val tagMinCount = 3
+    private val tagMinCount = 5 // tags with fewer bookmarks make thin shelves, so they're skipped
     private val tagPoolMax = 100
     private val tagPoolTtlMs = 60L * 60L * 1000L
+    private val tagRotationMs = 6L * 60L * 60L * 1000L
 
     private val tagPoolKey = "tag_pool_json"
     private val tagPoolTsKey = "tag_pool_ts"
+    private val tagSelectionKey = "tag_selection_json"
+    private val tagSelectionBucketKey = "tag_selection_bucket"
 
     // Ignore unknown fields: vxtwitter returns many fields we don't declare.
     private val mapper = jacksonObjectMapper()
@@ -413,8 +417,47 @@ class RaindropProvider : MainAPI() {
         }
     }
 
-    // Which tag shelves to show right now (top tags for now).
-    private fun selectedTags(): List<String> = readTagPool().take(tagShelfCount)
+    // Index of the current 6-hour window in local time (flips at 00:00, 06:00, 12:00 and 18:00).
+    private fun currentTagBucket(): Long {
+        val now = System.currentTimeMillis()
+        return (now + java.util.TimeZone.getDefault().getOffset(now)) / tagRotationMs
+    }
+
+    // Which tag shelves to show right now: a random pick from the tag pool that stays the same
+    // for the whole 6-hour window, then changes. The next pick avoids repeating the last one
+    // whenever the pool is big enough.
+    private fun selectedTags(): List<String> {
+        val ctx = com.lagradost.cloudstream3.CloudStreamApp.context ?: return emptyList()
+        val pool = readTagPool()
+        if (pool.isEmpty()) return emptyList()
+
+        val prefs = raindropPrefs(ctx)
+        val bucket = currentTagBucket()
+
+        val previous: List<String> = try {
+            prefs.getString(tagSelectionKey, null)
+                ?.let { mapper.readValue<List<String>>(it) }
+                ?: emptyList()
+        } catch (e: Exception) {
+            emptyList()
+        }
+
+        // Same window as the stored pick: keep the same shelves.
+        if (prefs.getLong(tagSelectionBucketKey, -1L) == bucket) {
+            val stillValid = previous.filter { it in pool }
+            if (stillValid.size >= minOf(tagShelfCount, pool.size)) return stillValid
+        }
+
+        val fresh = pool.filter { it !in previous }
+        val candidates = if (fresh.size >= tagShelfCount) fresh else pool
+        val picked = candidates.shuffled(kotlin.random.Random(bucket)).take(tagShelfCount)
+
+        prefs.edit()
+            .putString(tagSelectionKey, mapper.writeValueAsString(picked))
+            .putLong(tagSelectionBucketKey, bucket)
+            .apply()
+        return picked
+    }
 
     private fun tagQuery(tag: String): String =
         if (tag.any { it.isWhitespace() }) "#\"$tag\"" else "#$tag"
