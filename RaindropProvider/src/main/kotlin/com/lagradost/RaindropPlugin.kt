@@ -7,7 +7,10 @@ import com.lagradost.cloudstream3.plugins.Plugin
 @CloudstreamPlugin
 class RaindropPlugin : Plugin() {
     override fun load(context: Context) {
-        registerMainAPI(RaindropProvider())
+        val provider = RaindropProvider()
+        registerMainAPI(provider)
+        // Fetch the tag list in the background so the tag shelves exist when the home page opens.
+        provider.warmUp()
         openSettings = { ctx -> RaindropSettings.show(ctx) }
     }
 }
