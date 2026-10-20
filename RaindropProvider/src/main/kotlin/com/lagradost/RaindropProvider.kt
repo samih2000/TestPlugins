@@ -72,7 +72,7 @@ class RaindropProvider : MainAPI() {
 
     // A tile waits at most this long for its tweet lookup. A slow lookup keeps running in the
     // background and fills the cache, so the tile shows its thumbnail on the next load.
-    private val tileFetchTimeoutMs = 6_000L
+    private val tileFetchTimeoutMs = 10_000L
 
     // While diagnosing slow thumbnails: shows a short toast when a shelf has tiles without a
     // thumbnail, with the most recent failure reason. Set to false to silence it.
@@ -89,11 +89,13 @@ class RaindropProvider : MainAPI() {
 
     private fun authHeaders() = mapOf("Authorization" to "Bearer $raindropToken")
 
-    private val vxSemaphore = Semaphore(3)
-    private val vxDelayMs = 300L
+    // Home opens ~100 tiles at once, so these limits decide how fast thumbnails appear.
+    // If vxtwitter starts answering HTTP 429, lower the permits or raise the delay.
+    private val vxSemaphore = Semaphore(6)
+    private val vxDelayMs = 100L
 
-    private val twSemaphore = Semaphore(3)
-    private val twDelayMs = 300L
+    private val twSemaphore = Semaphore(4)
+    private val twDelayMs = 150L
 
     // In-memory layer in front of the disk cache: tweetId -> (time stored, tweet).
     private val tweetMemCache = ConcurrentHashMap<String, Pair<Long, VxTweet>>()
@@ -234,21 +236,93 @@ class RaindropProvider : MainAPI() {
 
     // ---------- Tweet fetching ----------
 
+    // Looks like a normal phone browser; a bare "Mozilla/5.0" is the kind of thing bot filters block.
+    private val browserHeaders = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+        "Accept" to "application/json,text/plain,*/*",
+        "Accept-Language" to "en-US,en;q=0.9"
+    )
+
+    // After an HTTP 403/429 a source is skipped for a while, instead of sending ~100 more
+    // requests it will refuse (each of which also makes the tiles wait).
+    private val blockedBackoffMs = 10L * 60L * 1000L
+
+    @Volatile
+    private var vxBlockedUntil = 0L
+
+    @Volatile
+    private var fxBlockedUntil = 0L
+
     private suspend fun fetchVxTweet(username: String, tweetId: String): VxTweet? =
         vxSemaphore.withPermit {
+            if (System.currentTimeMillis() < vxBlockedUntil) return@withPermit null
             val fetched = try {
-                val res = app.get(
-                    "https://api.vxtwitter.com/$username/status/$tweetId",
-                    headers = mapOf("User-Agent" to "Mozilla/5.0")
-                )
+                val vxUrl = "https://api.vxtwitter.com/$username/status/$tweetId"
+                var res = app.get(vxUrl, headers = browserHeaders)
+                if (res.code == 429) {
+                    // Rate limited: back off once and try again.
+                    delay(1500)
+                    res = app.get(vxUrl, headers = browserHeaders)
+                }
                 if (res.code == 200) {
                     mapper.readValue<VxTweet>(res.text)
                 } else {
                     lastFailure = "vxtwitter HTTP ${res.code}"
+                    if (res.code == 403 || res.code == 429) {
+                        vxBlockedUntil = System.currentTimeMillis() + blockedBackoffMs
+                    }
                     null
                 }
             } catch (e: Exception) {
                 lastFailure = "vxtwitter ${e.javaClass.simpleName}"
+                null
+            }
+            delay(vxDelayMs)
+            fetched
+        }
+
+    // FxTwitter has its own JSON shape: tweet.text, tweet.media.videos[], tweet.media.photos[].
+    private suspend fun fetchFxTweet(username: String, tweetId: String): VxTweet? =
+        vxSemaphore.withPermit {
+            if (System.currentTimeMillis() < fxBlockedUntil) return@withPermit null
+            val fetched = try {
+                val res = app.get(
+                    "https://api.fxtwitter.com/$username/status/$tweetId",
+                    headers = browserHeaders
+                )
+                if (res.code != 200) {
+                    lastFailure = "fxtwitter HTTP ${res.code}"
+                    if (res.code == 403 || res.code == 429) {
+                        fxBlockedUntil = System.currentTimeMillis() + blockedBackoffMs
+                    }
+                    null
+                } else {
+                    val tweet = mapper.readTree(res.text).path("tweet")
+                    val text = tweet.path("text").asText(null)?.takeIf { it.isNotBlank() }
+                    val media = tweet.path("media")
+                    val list = mutableListOf<VxMedia>()
+                    for (v in media.path("videos")) {
+                        list.add(
+                            VxMedia(
+                                type = if (v.path("type").asText() == "gif") "gif" else "video",
+                                url = v.path("url").asText(null)?.takeIf { it.isNotBlank() },
+                                thumbnail_url = v.path("thumbnail_url").asText(null)
+                                    ?.takeIf { it.isNotBlank() }
+                            )
+                        )
+                    }
+                    if (list.isEmpty()) {
+                        for (p in media.path("photos")) {
+                            val purl = p.path("url").asText(null)?.takeIf { it.isNotBlank() }
+                            if (purl != null) list.add(VxMedia("photo", null, purl))
+                        }
+                    }
+                    if (list.isEmpty() && text == null) null
+                    else VxTweet(list.ifEmpty { null }, null, text)
+                }
+            } catch (e: Exception) {
+                lastFailure = "fxtwitter ${e.javaClass.simpleName}"
                 null
             }
             delay(vxDelayMs)
@@ -347,29 +421,36 @@ class RaindropProvider : MainAPI() {
         }
     }
 
-    // The actual network work: vxtwitter first, then the authenticated X API for whatever is missing.
-    private suspend fun fetchTweetMediaFromNetwork(username: String, tweetId: String): VxTweet? {
-        val vx = fetchVxTweet(username, tweetId)
-        val vxMedia = vx?.media_extended?.firstOrNull()
-        val hasThumb = !vxMedia?.thumbnail_url.isNullOrBlank()
-        val hasVideo = !vxMedia?.url.isNullOrBlank()
-        val hasText = !vx?.text.isNullOrBlank()
-        if (hasThumb && hasVideo && hasText) return vx
+    private fun isCompleteTweet(t: VxTweet?): Boolean =
+        t != null && isFullTweet(t) && !t.text.isNullOrBlank()
 
-        // Fall back to the authenticated X API for anything vxtwitter couldn't provide.
-        val auth = fetchAuthenticatedTweet(tweetId)
-        val authMedia = auth?.media_extended?.firstOrNull()
-
-        val merged = VxMedia(
-            type = vxMedia?.type ?: authMedia?.type,
-            url = vxMedia?.url?.takeIf { it.isNotBlank() } ?: authMedia?.url,
-            thumbnail_url = vxMedia?.thumbnail_url?.takeIf { it.isNotBlank() } ?: authMedia?.thumbnail_url
+    // Fills the gaps of `a` with whatever `b` has (first media item and text).
+    private fun mergeTweets(a: VxTweet?, b: VxTweet?): VxTweet? {
+        if (a == null) return b
+        if (b == null) return a
+        val am = a.media_extended?.firstOrNull()
+        val bm = b.media_extended?.firstOrNull()
+        val media = VxMedia(
+            type = am?.type ?: bm?.type,
+            url = am?.url?.takeIf { it.isNotBlank() } ?: bm?.url,
+            thumbnail_url = am?.thumbnail_url?.takeIf { it.isNotBlank() } ?: bm?.thumbnail_url
         )
-        val text = vx?.text?.takeIf { it.isNotBlank() } ?: auth?.text
-        val mediaList = if (merged.url == null && merged.thumbnail_url == null) null else listOf(merged)
-
+        val mediaList = if (media.url == null && media.thumbnail_url == null) null else listOf(media)
+        val text = a.text?.takeIf { it.isNotBlank() } ?: b.text
         if (mediaList == null && text == null) return null
-        return VxTweet(media_extended = mediaList, mediaURLs = vx?.mediaURLs, text = text)
+        return VxTweet(media_extended = mediaList, mediaURLs = a.mediaURLs ?: b.mediaURLs, text = text)
+    }
+
+    // The actual network work. Sources in order: vxtwitter, FxTwitter, then the authenticated
+    // X API. Each one is only asked for what the previous ones couldn't provide.
+    private suspend fun fetchTweetMediaFromNetwork(username: String, tweetId: String): VxTweet? {
+        var result = fetchVxTweet(username, tweetId)
+        if (isCompleteTweet(result)) return result
+
+        result = mergeTweets(result, fetchFxTweet(username, tweetId))
+        if (isCompleteTweet(result)) return result
+
+        return mergeTweets(result, fetchAuthenticatedTweet(tweetId))
     }
 
     // Cache-first: memory, then disk, then network. Only real results are stored.
