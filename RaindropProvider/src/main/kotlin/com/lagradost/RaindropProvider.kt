@@ -1,5 +1,6 @@
 package com.lagradost
 
+import android.content.Context
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
@@ -21,6 +22,7 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import java.net.URLEncoder
+import java.util.concurrent.ConcurrentHashMap
 
 class RaindropProvider : MainAPI() {
     override var mainUrl = "https://api.raindrop.io"
@@ -48,6 +50,19 @@ class RaindropProvider : MainAPI() {
     private val tagSelectionKey = "tag_selection_json"
     private val tagSelectionBucketKey = "tag_selection_bucket"
 
+    // ---------- Tweet cache settings ----------
+
+    // Resolved tweets (thumbnail, video URL, text) are stored on disk so a tile only needs the
+    // network the first time it is ever shown.
+    private val tweetCachePrefsName = "raindrop_tweet_cache"
+    // Tweets with both a thumbnail and a video URL practically never change.
+    private val tweetCacheFullTtlMs = 7L * 24L * 60L * 60L * 1000L
+    // Incomplete results (no video, no thumbnail) are retried sooner, e.g. after adding X cookies.
+    private val tweetCachePartialTtlMs = 60L * 60L * 1000L
+    // Total failures (deleted tweet, rate limit) are only remembered for this session, briefly.
+    private val tweetMissTtlMs = 10L * 60L * 1000L
+    private val tweetCacheMaxEntries = 1500
+
     // Ignore unknown fields: vxtwitter returns many fields we don't declare.
     private val mapper = jacksonObjectMapper()
         .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
@@ -61,13 +76,14 @@ class RaindropProvider : MainAPI() {
 
     private val vxSemaphore = Semaphore(3)
     private val vxDelayMs = 300L
-    private val vxCache = mutableMapOf<String, VxTweet?>()
-    private val vxCacheMutex = Mutex()
 
     private val twSemaphore = Semaphore(3)
     private val twDelayMs = 300L
-    private val twCache = mutableMapOf<String, VxTweet?>()
-    private val twCacheMutex = Mutex()
+
+    // In-memory layer in front of the disk cache: tweetId -> (time stored, tweet).
+    private val tweetMemCache = ConcurrentHashMap<String, Pair<Long, VxTweet>>()
+    // tweetId -> time of the last complete failure.
+    private val tweetMissCache = ConcurrentHashMap<String, Long>()
 
     data class RaindropItem(
         @JsonProperty("_id") val id: Long,
@@ -113,13 +129,83 @@ class RaindropProvider : MainAPI() {
         return "https://x.com/${m.groupValues[1]}/status/${m.groupValues[2]}"
     }
 
+    // ---------- Tweet cache (memory + disk) ----------
+
+    private fun tweetCachePrefs() =
+        com.lagradost.cloudstream3.CloudStreamApp.context
+            ?.getSharedPreferences(tweetCachePrefsName, Context.MODE_PRIVATE)
+
+    private fun isFullTweet(t: VxTweet): Boolean {
+        val m = t.media_extended?.firstOrNull()
+        return !m?.url.isNullOrBlank() && !m?.thumbnail_url.isNullOrBlank()
+    }
+
+    private fun cacheTtlFor(t: VxTweet): Long =
+        if (isFullTweet(t)) tweetCacheFullTtlMs else tweetCachePartialTtlMs
+
+    // Disk entries are stored as "<epochMs>|<json>" so the timestamp can be read without parsing the JSON.
+    private fun readCachedTweet(tweetId: String): VxTweet? {
+        val now = System.currentTimeMillis()
+
+        tweetMemCache[tweetId]?.let { (ts, tweet) ->
+            if (now - ts < cacheTtlFor(tweet)) return tweet
+            tweetMemCache.remove(tweetId)
+        }
+
+        val raw = tweetCachePrefs()?.getString(tweetId, null) ?: return null
+        val parts = raw.split("|", limit = 2)
+        val ts = parts.getOrNull(0)?.toLongOrNull() ?: return null
+        val json = parts.getOrNull(1) ?: return null
+        val tweet = try {
+            mapper.readValue<VxTweet>(json)
+        } catch (e: Exception) {
+            return null
+        }
+        if (now - ts >= cacheTtlFor(tweet)) return null
+
+        tweetMemCache[tweetId] = ts to tweet
+        return tweet
+    }
+
+    private fun writeCachedTweet(tweetId: String, tweet: VxTweet) {
+        val now = System.currentTimeMillis()
+        tweetMemCache[tweetId] = now to tweet
+        try {
+            tweetCachePrefs()?.edit()
+                ?.putString(tweetId, "$now|${mapper.writeValueAsString(tweet)}")
+                ?.apply()
+        } catch (e: Exception) {
+            // best effort
+        }
+    }
+
+    // Drops expired entries and, if the cache is still too big, the oldest ones.
+    private fun pruneTweetCache() {
+        val prefs = tweetCachePrefs() ?: return
+        val now = System.currentTimeMillis()
+        val remove = mutableListOf<String>()
+        val live = mutableListOf<Pair<String, Long>>()
+
+        prefs.all.forEach { (key, value) ->
+            val ts = (value as? String)?.substringBefore('|')?.toLongOrNull()
+            if (ts == null || now - ts > tweetCacheFullTtlMs) remove.add(key) else live.add(key to ts)
+        }
+        if (live.size > tweetCacheMaxEntries) {
+            live.sortedBy { it.second }
+                .take(live.size - tweetCacheMaxEntries)
+                .forEach { remove.add(it.first) }
+        }
+        if (remove.isNotEmpty()) {
+            val editor = prefs.edit()
+            remove.forEach { editor.remove(it) }
+            editor.apply()
+        }
+    }
+
     // ---------- Tweet fetching ----------
 
-    private suspend fun fetchVxTweet(username: String, tweetId: String): VxTweet? {
-        vxCacheMutex.withLock {
-            if (vxCache.containsKey(tweetId)) return vxCache[tweetId]
-        }
-        val result = vxSemaphore.withPermit {
+    private suspend fun fetchVxTweet(username: String, tweetId: String): VxTweet? =
+        vxSemaphore.withPermit {
             val fetched = try {
                 val json = app.get(
                     "https://api.vxtwitter.com/$username/status/$tweetId",
@@ -132,9 +218,6 @@ class RaindropProvider : MainAPI() {
             delay(vxDelayMs)
             fetched
         }
-        vxCacheMutex.withLock { vxCache[tweetId] = result }
-        return result
-    }
 
     private suspend fun fetchAuthenticatedTweet(tweetId: String): VxTweet? {
         val ctx = com.lagradost.cloudstream3.CloudStreamApp.context ?: return null
@@ -144,11 +227,7 @@ class RaindropProvider : MainAPI() {
         val ct0 = prefs.getString(TWITTER_CT0_KEY, null)?.takeIf { it.isNotBlank() }
             ?: return null
 
-        twCacheMutex.withLock {
-            if (twCache.containsKey(tweetId)) return twCache[tweetId]
-        }
-
-        val result = twSemaphore.withPermit {
+        return twSemaphore.withPermit {
             val fetched = try {
                 val queryId = "2ICDjqPd81tulZcYrtpTuQ"
                 val variables = "{\"tweetId\":\"$tweetId\",\"withCommunity\":false," +
@@ -227,15 +306,10 @@ class RaindropProvider : MainAPI() {
             delay(twDelayMs)
             fetched
         }
-
-        twCacheMutex.withLock { twCache[tweetId] = result }
-        return result
     }
 
-    private suspend fun fetchTweetMedia(tweetUrl: String): VxTweet? {
-        val match = tweetRegex.find(tweetUrl) ?: return null
-        val (username, tweetId) = match.destructured
-
+    // The actual network work: vxtwitter first, then the authenticated X API for whatever is missing.
+    private suspend fun fetchTweetMediaFromNetwork(username: String, tweetId: String): VxTweet? {
         val vx = fetchVxTweet(username, tweetId)
         val vxMedia = vx?.media_extended?.firstOrNull()
         val hasThumb = !vxMedia?.thumbnail_url.isNullOrBlank()
@@ -257,6 +331,27 @@ class RaindropProvider : MainAPI() {
 
         if (mediaList == null && text == null) return null
         return VxTweet(media_extended = mediaList, mediaURLs = vx?.mediaURLs, text = text)
+    }
+
+    // Cache-first: memory, then disk, then network. Only real results are stored.
+    private suspend fun fetchTweetMedia(tweetUrl: String): VxTweet? {
+        val match = tweetRegex.find(tweetUrl) ?: return null
+        val (username, tweetId) = match.destructured
+
+        readCachedTweet(tweetId)?.let { return it }
+
+        val now = System.currentTimeMillis()
+        val lastMiss = tweetMissCache[tweetId]
+        if (lastMiss != null && now - lastMiss < tweetMissTtlMs) return null
+
+        val result = fetchTweetMediaFromNetwork(username, tweetId)
+        if (result != null) {
+            tweetMissCache.remove(tweetId)
+            writeCachedTweet(tweetId, result)
+        } else {
+            tweetMissCache[tweetId] = now
+        }
+        return result
     }
 
     // ---------- Titles ----------
@@ -411,6 +506,11 @@ class RaindropProvider : MainAPI() {
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 refreshTagPoolIfStale()
+            } catch (e: Exception) {
+                // best effort
+            }
+            try {
+                pruneTweetCache()
             } catch (e: Exception) {
                 // best effort
             }
