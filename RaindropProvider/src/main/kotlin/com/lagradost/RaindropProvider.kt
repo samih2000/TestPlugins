@@ -46,6 +46,7 @@ class RaindropProvider : MainAPI() {
     // shelfMaxPages pages (4 x 16 = 64 tiles).
     private val shelfRowSize = 16
     private val shelfMaxPages = 4
+    private val recentMaxPages = 8 // 8 pages x 8 tiles = 64, same total as the other shelves
     private val recentShelfSize = 8
     private val tagShelfCount = 6
     private val tagMinCount = 5 // tags with fewer bookmarks make thin shelves, so they're skipped
@@ -746,20 +747,24 @@ class RaindropProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val data = request.data
         return when {
+            
             data == "recent" -> {
-                refreshTagPoolIfStale()
-                newHomePageResponse(request.name, fetchShelf(null, recentShelfSize), false)
+    if (page == 1) refreshTagPoolIfStale()
+    val items = fetchShelf(null, recentShelfSize, page - 1)
+    newHomePageResponse(
+        request.name,
+        items,
+        page < recentMaxPages && items.size >= recentShelfSize
+    )
             }
-
-            data == "random" -> {
-                val items = fetchRandomShelf(page)
-                newHomePageResponse(
-                    request.name,
-                    items,
-                    page < shelfMaxPages && items.size >= shelfRowSize
-                )
-            }
-
+        data == "random" -> {
+            val items = fetchRandomShelf(page)
+            newHomePageResponse(
+                request.name,
+                items,
+                page < shelfMaxPages && items.size >= shelfRowSize
+            )
+        }
             data.startsWith("tag:") -> {
                 val items = fetchShelf(tagQuery(data.removePrefix("tag:")), shelfRowSize, page - 1)
                 newHomePageResponse(
