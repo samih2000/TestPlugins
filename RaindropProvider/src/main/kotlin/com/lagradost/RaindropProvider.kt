@@ -41,14 +41,19 @@ class RaindropProvider : MainAPI() {
 
     // ---------- Shelf layout ----------
 
-    // Each shelf starts with one page of 16 tiles. CloudStream loads the next page when the
-    // row is swiped to its end or the expanded grid is scrolled to the bottom, up to
-    // shelfMaxPages pages (4 x 16 = 64 tiles).
+    // Recent and Random keep their original sizes. CloudStream loads the next page when the
+    // row is swiped to its end or the expanded grid is scrolled to the bottom.
     private val shelfRowSize = 16
-    private val shelfMaxPages = 4
-    private val recentMaxPages = 8 // 8 pages x 8 tiles = 64, same total as the other shelves
+    private val shelfMaxPages = 4 // Random Picks: 4 x 16 = 64 tiles
+    private val recentMaxPages = 8 // 8 pages x 8 tiles = 64
     private val recentShelfSize = 8
-    private val tagShelfCount = 6
+
+    // Tag shelves: 10 shelves (+ Recently Added + Random Picks = 12 total, never more).
+    // 12 tiles per page, up to 5 pages (60 tiles when expanded).
+    private val tagShelfCount = 10
+    private val tagPageSize = 12
+    private val tagMaxPages = 5
+    private val tagRotateCount = 3 // how many tag shelves are swapped out every rotation window
     private val tagMinCount = 5 // tags with fewer bookmarks make thin shelves, so they're skipped
     private val tagPoolMax = 100
     private val tagPoolTtlMs = 60L * 60L * 1000L
@@ -70,7 +75,12 @@ class RaindropProvider : MainAPI() {
     private val tweetCachePartialTtlMs = 60L * 60L * 1000L
     // Total failures (deleted tweet, rate limit) are only remembered for this session, briefly.
     private val tweetMissTtlMs = 10L * 60L * 1000L
-    private val tweetCacheMaxEntries = 1500
+    private val tweetCacheMaxEntries = 2500
+
+    // Background pre-warm: how many tweet lookups it may run at once, and the pause between
+    // them. Kept small so it can't starve lookups for tiles the user is actually looking at.
+    private val prewarmWorkers = 2
+    private val prewarmDelayMs = 200L
 
     // Each single request to vxtwitter / FxTwitter / X gives up after this many seconds, so a
     // hung connection can't hold one of the lookup slots for 30+ seconds.
@@ -95,7 +105,7 @@ class RaindropProvider : MainAPI() {
 
     private fun authHeaders() = mapOf("Authorization" to "Bearer $raindropToken")
 
-    // Home opens ~100 tiles at once, so these limits decide how fast thumbnails appear.
+    // Home opens ~140 tiles at once, so these limits decide how fast thumbnails appear.
     // If vxtwitter starts answering HTTP 429, lower the permits or raise the delay.
     private val vxSemaphore = Semaphore(6)
     private val vxDelayMs = 100L
@@ -576,20 +586,25 @@ class RaindropProvider : MainAPI() {
 
     // ---------- Raindrop shelves ----------
 
-    // pageIndex is Raindrop's own 0-based page number.
+    // Raw bookmark list for a shelf. pageIndex is Raindrop's own 0-based page number.
+    private suspend fun fetchShelfItems(
+        searchQuery: String?,
+        perPage: Int,
+        pageIndex: Int = 0
+    ): List<RaindropItem> {
+        val q = searchQuery?.let { "&search=" + URLEncoder.encode(it, "UTF-8") } ?: ""
+        return app.get(
+            "$mainUrl/rest/v1/raindrops/0?sort=-created&perpage=$perPage&page=$pageIndex$q",
+            headers = authHeaders()
+        ).parsedSafe<RaindropListResponse>()?.items ?: emptyList()
+    }
+
     private suspend fun fetchShelf(
         searchQuery: String?,
         perPage: Int,
         pageIndex: Int = 0
-    ): List<SearchResponse> {
-        val q = searchQuery?.let { "&search=" + URLEncoder.encode(it, "UTF-8") } ?: ""
-        val res = app.get(
-            "$mainUrl/rest/v1/raindrops/0?sort=-created&perpage=$perPage&page=$pageIndex$q",
-            headers = authHeaders()
-        ).parsedSafe<RaindropListResponse>()
-
-        return res?.items?.toSearchResponses() ?: emptyList()
-    }
+    ): List<SearchResponse> =
+        fetchShelfItems(searchQuery, perPage, pageIndex).toSearchResponses()
 
     // Random Picks: one shuffled pool of (row size x max pages) bookmarks, built when the home page
     // loads. Expanding the shelf reads the next slice of the SAME pool, so page 2 never repeats page 1.
@@ -597,33 +612,35 @@ class RaindropProvider : MainAPI() {
     private val randomPoolMutex = Mutex()
 
     private suspend fun buildRandomPool(): List<RaindropItem> = coroutineScope {
-    val pageSize = 50 // Raindrop's maximum per request
-    val recentCount = recentMaxPages * recentShelfSize // the 64 newest, shown in Recently Added
-    val total = app.get("$mainUrl/rest/v1/raindrops/0?perpage=1", headers = authHeaders())
-        .parsedSafe<RaindropListResponse>()?.count ?: 0
-    if (total == 0) return@coroutineScope emptyList()
+        val pageSize = 50 // Raindrop's maximum per request
+        val total = app.get("$mainUrl/rest/v1/raindrops/0?perpage=1", headers = authHeaders())
+            .parsedSafe<RaindropListResponse>()?.count ?: 0
+        if (total == 0) return@coroutineScope emptyList()
 
-    // A tiny library would leave nothing to pick from, so only skip when there's more than that.
-    val skip = if (total > recentCount) recentCount else 0
-    val totalPages = ((total - 1) / pageSize) + 1
-    val firstPage = skip / pageSize
-    val pages = (firstPage until totalPages).shuffled().take(2)
+        // The 64 newest bookmarks are what Recently Added shows, so Random Picks skips them.
+        val recentCount = recentMaxPages * recentShelfSize
+        // A tiny library would leave nothing to pick from, so only skip when there's more than that.
+        val skip = if (total > recentCount) recentCount else 0
+        val totalPages = ((total - 1) / pageSize) + 1
+        val firstPage = skip / pageSize
+        // Two distinct random pages: more variety, and the last partial page still gets picked sometimes.
+        val pages = (firstPage until totalPages).shuffled().take(2)
 
-    pages.map { p ->
-        async {
-            val items = app.get(
-                "$mainUrl/rest/v1/raindrops/0?sort=-created&perpage=$pageSize&page=$p",
-                headers = authHeaders()
-            ).parsedSafe<RaindropListResponse>()?.items ?: emptyList()
-            // Position in the newest-first list; drop anything inside the Recently Added range.
-            items.filterIndexed { i, _ -> p * pageSize + i >= skip }
-        }
-    }.awaitAll()
-        .flatten()
-        .distinctBy { it.id }
-        .shuffled()
-        .take(shelfRowSize * shelfMaxPages)
-}
+        pages.map { p ->
+            async {
+                val items = app.get(
+                    "$mainUrl/rest/v1/raindrops/0?sort=-created&perpage=$pageSize&page=$p",
+                    headers = authHeaders()
+                ).parsedSafe<RaindropListResponse>()?.items ?: emptyList()
+                // Position in the newest-first list; drop anything inside the Recently Added range.
+                items.filterIndexed { i, _ -> p * pageSize + i >= skip }
+            }
+        }.awaitAll()
+            .flatten()
+            .distinctBy { it.id }
+            .shuffled()
+            .take(shelfRowSize * shelfMaxPages)
+    }
 
     private suspend fun fetchRandomShelf(page: Int): List<SearchResponse> {
         val pool = randomPoolMutex.withLock {
@@ -674,7 +691,11 @@ class RaindropProvider : MainAPI() {
             .apply()
     }
 
-    /** Called by the plugin at app start so the tag shelves exist by the time the home page opens. */
+    /**
+     * Called by the plugin at app start. Refreshes the tag list so the tag shelves exist by the
+     * time the home page opens, trims the tweet cache, then pre-warms the tweet cache for the
+     * shelves that are showing and the ones about to rotate in.
+     */
     fun warmUp() {
         CoroutineScope(Dispatchers.IO).launch {
             try {
@@ -687,6 +708,11 @@ class RaindropProvider : MainAPI() {
             } catch (e: Exception) {
                 // best effort
             }
+            try {
+                prewarmTagShelves()
+            } catch (e: Exception) {
+                // best effort
+            }
         }
     }
 
@@ -696,9 +722,34 @@ class RaindropProvider : MainAPI() {
         return (now + java.util.TimeZone.getDefault().getOffset(now)) / tagRotationMs
     }
 
-    // Which tag shelves to show right now: a random pick from the tag pool that stays the same
-    // for the whole 6-hour window, then changes. The next pick avoids repeating the last one
-    // whenever the pool is big enough.
+    // Next tag selection given the current one. The list is ordered oldest -> newest.
+    //  - No previous selection: pick a full set at random.
+    //  - Otherwise: drop the `tagRotateCount` oldest tags (only once the list is full) and fill
+    //    the free slots with random tags from the pool that are not showing right now and were
+    //    not just dropped (falls back to the whole pool if it is too small for that).
+    // Seeded by `bucket`, so the same inputs always give the same result. That is what lets
+    // the pre-warm know which tags will rotate in next.
+    private fun computeNextSelection(previous: List<String>, pool: List<String>, bucket: Long): List<String> {
+        val target = minOf(tagShelfCount, pool.size)
+        val rng = kotlin.random.Random(bucket)
+        if (previous.isEmpty()) return pool.shuffled(rng).take(target)
+
+        val kept = if (previous.size >= target) {
+            previous.takeLast((target - tagRotateCount).coerceAtLeast(0))
+        } else {
+            previous
+        }
+        val needed = target - kept.size
+        if (needed <= 0) return kept.take(target)
+
+        val fresh = pool.filter { it !in previous }
+        val candidates = if (fresh.size >= needed) fresh else pool.filter { it !in kept }
+        return kept + candidates.shuffled(rng).take(needed)
+    }
+
+    // Which tag shelves to show right now. Within one 6-hour window the selection never changes.
+    // When a new window starts, only `tagRotateCount` shelves are swapped (see computeNextSelection),
+    // so most shelves keep their already-cached tiles.
     private fun selectedTags(): List<String> {
         val ctx = com.lagradost.cloudstream3.CloudStreamApp.context ?: return emptyList()
         val pool = readTagPool()
@@ -706,6 +757,7 @@ class RaindropProvider : MainAPI() {
 
         val prefs = raindropPrefs(ctx)
         val bucket = currentTagBucket()
+        val target = minOf(tagShelfCount, pool.size)
 
         val previous: List<String> = try {
             prefs.getString(tagSelectionKey, null)
@@ -713,17 +765,14 @@ class RaindropProvider : MainAPI() {
                 ?: emptyList()
         } catch (e: Exception) {
             emptyList()
-        }
+        }.filter { it in pool }.distinct()
 
         // Same window as the stored pick: keep the same shelves.
-        if (prefs.getLong(tagSelectionBucketKey, -1L) == bucket) {
-            val stillValid = previous.filter { it in pool }
-            if (stillValid.size >= minOf(tagShelfCount, pool.size)) return stillValid
+        if (prefs.getLong(tagSelectionBucketKey, -1L) == bucket && previous.size >= target) {
+            return previous.take(target)
         }
 
-        val fresh = pool.filter { it !in previous }
-        val candidates = if (fresh.size >= tagShelfCount) fresh else pool
-        val picked = candidates.shuffled(kotlin.random.Random(bucket)).take(tagShelfCount)
+        val picked = computeNextSelection(previous, pool, bucket)
 
         prefs.edit()
             .putString(tagSelectionKey, mapper.writeValueAsString(picked))
@@ -735,10 +784,50 @@ class RaindropProvider : MainAPI() {
     private fun tagQuery(tag: String): String =
         if (tag.any { it.isWhitespace() }) "#\"$tag\"" else "#$tag"
 
+    // ---------- Background pre-warm ----------
+
+    // Warms the tweet cache for page 1 of every tag shelf on screen, plus the shelves that will
+    // rotate in at the next window. Runs slowly on purpose (few workers, small pauses) and stops
+    // as soon as vxtwitter and FxTwitter are both rate limiting us.
+    private suspend fun prewarmTagShelves() {
+        if (raindropToken.isBlank()) return
+        val pool = readTagPool()
+        if (pool.isEmpty()) return
+
+        val current = selectedTags()
+        val incoming = computeNextSelection(current, pool, currentTagBucket() + 1)
+            .filter { it !in current }
+        val gate = Semaphore(prewarmWorkers)
+
+        for (tag in current + incoming) {
+            val items = try {
+                fetchShelfItems(tagQuery(tag), tagPageSize, 0)
+            } catch (e: Exception) {
+                emptyList()
+            }
+            coroutineScope {
+                items.map { item ->
+                    async {
+                        gate.withPermit {
+                            val now = System.currentTimeMillis()
+                            val bothBlocked = now < vxBlockedUntil && now < fxBlockedUntil
+                            if (!bothBlocked && tweetIdOf(item.link) != null) {
+                                // Cached tweets return instantly; only cold ones touch the network.
+                                withTimeoutOrNull(tileFetchTimeoutMs) { fetchTweetMedia(item.link) }
+                                delay(prewarmDelayMs)
+                            }
+                        }
+                    }
+                }.awaitAll()
+            }
+        }
+    }
+
     // ---------- Main page ----------
 
     // One request per shelf, so CloudStream can paginate (expand) each shelf on its own.
     // `data` -> `name` order is the CloudStream convention for mainPageOf.
+    // Always 2 fixed shelves + up to tagShelfCount tag shelves = at most 12.
     override val mainPage: List<MainPageData>
         get() {
             val shelves = mutableListOf(
@@ -752,30 +841,31 @@ class RaindropProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val data = request.data
         return when {
-            
             data == "recent" -> {
-    if (page == 1) refreshTagPoolIfStale()
-    val items = fetchShelf(null, recentShelfSize, page - 1)
-    newHomePageResponse(
-        request.name,
-        items,
-        page < recentMaxPages && items.size >= recentShelfSize
-    )
+                if (page == 1) refreshTagPoolIfStale()
+                val items = fetchShelf(null, recentShelfSize, page - 1)
+                newHomePageResponse(
+                    request.name,
+                    items,
+                    page < recentMaxPages && items.size >= recentShelfSize
+                )
             }
-        data == "random" -> {
-            val items = fetchRandomShelf(page)
-            newHomePageResponse(
-                request.name,
-                items,
-                page < shelfMaxPages && items.size >= shelfRowSize
-            )
-        }
-            data.startsWith("tag:") -> {
-                val items = fetchShelf(tagQuery(data.removePrefix("tag:")), shelfRowSize, page - 1)
+
+            data == "random" -> {
+                val items = fetchRandomShelf(page)
                 newHomePageResponse(
                     request.name,
                     items,
                     page < shelfMaxPages && items.size >= shelfRowSize
+                )
+            }
+
+            data.startsWith("tag:") -> {
+                val items = fetchShelf(tagQuery(data.removePrefix("tag:")), tagPageSize, page - 1)
+                newHomePageResponse(
+                    request.name,
+                    items,
+                    page < tagMaxPages && items.size >= tagPageSize
                 )
             }
 
