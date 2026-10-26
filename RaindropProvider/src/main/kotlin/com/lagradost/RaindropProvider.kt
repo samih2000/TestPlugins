@@ -597,28 +597,33 @@ class RaindropProvider : MainAPI() {
     private val randomPoolMutex = Mutex()
 
     private suspend fun buildRandomPool(): List<RaindropItem> = coroutineScope {
-        val pageSize = 50 // Raindrop's maximum per request
-        val total = app.get("$mainUrl/rest/v1/raindrops/0?perpage=1", headers = authHeaders())
-            .parsedSafe<RaindropListResponse>()?.count ?: 0
-        if (total == 0) return@coroutineScope emptyList()
+    val pageSize = 50 // Raindrop's maximum per request
+    val recentCount = recentMaxPages * recentShelfSize // the 64 newest, shown in Recently Added
+    val total = app.get("$mainUrl/rest/v1/raindrops/0?perpage=1", headers = authHeaders())
+        .parsedSafe<RaindropListResponse>()?.count ?: 0
+    if (total == 0) return@coroutineScope emptyList()
 
-        val totalPages = ((total - 1) / pageSize) + 1
-        // Two distinct random pages: more variety, and the last partial page still gets picked sometimes.
-        val pages = (0 until totalPages).shuffled().take(2)
+    // A tiny library would leave nothing to pick from, so only skip when there's more than that.
+    val skip = if (total > recentCount) recentCount else 0
+    val totalPages = ((total - 1) / pageSize) + 1
+    val firstPage = skip / pageSize
+    val pages = (firstPage until totalPages).shuffled().take(2)
 
-        pages.map { p ->
-            async {
-                app.get(
-                    "$mainUrl/rest/v1/raindrops/0?perpage=$pageSize&page=$p",
-                    headers = authHeaders()
-                ).parsedSafe<RaindropListResponse>()?.items ?: emptyList()
-            }
-        }.awaitAll()
-            .flatten()
-            .distinctBy { it.id }
-            .shuffled()
-            .take(shelfRowSize * shelfMaxPages)
-    }
+    pages.map { p ->
+        async {
+            val items = app.get(
+                "$mainUrl/rest/v1/raindrops/0?sort=-created&perpage=$pageSize&page=$p",
+                headers = authHeaders()
+            ).parsedSafe<RaindropListResponse>()?.items ?: emptyList()
+            // Position in the newest-first list; drop anything inside the Recently Added range.
+            items.filterIndexed { i, _ -> p * pageSize + i >= skip }
+        }
+    }.awaitAll()
+        .flatten()
+        .distinctBy { it.id }
+        .shuffled()
+        .take(shelfRowSize * shelfMaxPages)
+}
 
     private suspend fun fetchRandomShelf(page: Int): List<SearchResponse> {
         val pool = randomPoolMutex.withLock {
