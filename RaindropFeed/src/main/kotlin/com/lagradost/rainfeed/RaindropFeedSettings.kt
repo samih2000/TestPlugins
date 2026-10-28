@@ -10,14 +10,15 @@ import android.widget.Toast
 
 const val FEED_TOKEN_KEY = "feed_raindrop_token"
 // v2 key names, so older saved lists don't override the defaults below.
-const val FEED_PRIORITY_KEY = "feed_priority_v2"
+const val FEED_PRIORITY_KEY = "feed_priority_v3"
 const val FEED_ACCOUNTS_KEY = "feed_accounts_v2"
 private const val FEED_PREFS = "raindrop_feed_settings"
 
 // Keep both lists in sync with tools/xsync/accounts.json.
 const val DEFAULT_PRIORITY =
     "PornMommyPlus,throatdemonz,ZBPGoon,btvvids11,gothbaddiez,sloppygoonettes,throatmoods," +
-    "PornMommyPlusS,MommysBestBJs,gooningmoods,ecstasygoonsxxx,HornyJails_,SubbyGooner_,PornMommysCaps"
+    "PornMommyPlusS,MommysBestBJs,gooningmoods,ecstasygoonsxxx,HornyJails_,SubbyGooner_,PornMommysCaps," +
+    "certigooners,goonsticklover,GoonGwynn,goonettearchive,Hornymilfv2"
 
 const val DEFAULT_ACCOUNTS =
     "AestheticBLJB,GoonHours1,Momhavevideo,lahlah084,DrakenAbyss,missAnju_,Hinosbs," +
