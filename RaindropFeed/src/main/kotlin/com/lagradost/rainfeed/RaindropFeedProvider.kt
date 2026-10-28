@@ -14,8 +14,11 @@ import java.net.URLEncoder
  *   cover   -> thumbnail (tile poster)
  *   note    -> direct video URL(s), one per line
  *   excerpt -> tweet text
- *   tags    -> account name + "xsync"
+ *   tags    -> account name + "xsync" (+ "priority" for priority accounts)
  * so tiles and playback are a single Raindrop request each.
+ *
+ * Home page: "Priority Latest", "Latest", then 5 random priority accounts and 5 random
+ * other accounts. The random picks stay the same for 6 hours, then change.
  */
 class RaindropFeedProvider : MainAPI() {
     override var mainUrl = "https://api.raindrop.io"
@@ -27,6 +30,11 @@ class RaindropFeedProvider : MainAPI() {
     private val pageSize = 16
     private val maxPages = 6
     private val syncTag = "xsync"
+    private val priorityTag = "priority"
+
+    private val priorityShelfCount = 5
+    private val otherShelfCount = 5
+    private val rotationMs = 6L * 60L * 60L * 1000L
 
     private val token: String
         get() = CloudStreamApp.context
@@ -49,11 +57,6 @@ class RaindropFeedProvider : MainAPI() {
 
     private val tweetIdRegex = Regex("status/(\\d+)")
 
-    private fun accounts(): List<String> {
-        val ctx = CloudStreamApp.context ?: return emptyList()
-        return feedAccounts(ctx)
-    }
-
     // Raindrop search: "#tag" filters by tag, a bare word searches text.
     private suspend fun fetch(search: String, page: Int, perPage: Int): List<FeedItem> {
         val q = URLEncoder.encode(search, "UTF-8")
@@ -63,29 +66,48 @@ class RaindropFeedProvider : MainAPI() {
         ).parsedSafe<FeedResponse>()?.items ?: emptyList()
     }
 
-    private fun FeedItem.toTile(): SearchResponse {
-        val tile = newMovieSearchResponse(
+    private fun FeedItem.toTile(): SearchResponse =
+        newMovieSearchResponse(
             title?.takeIf { it.isNotBlank() } ?: link,
             link,
             TvType.Movie
         ) {
             this.posterUrl = cover?.takeIf { it.isNotBlank() }
         }
-        return tile
-    }
 
-    // ---------- Main page: "Latest" + one shelf per account ----------
+    // ---------- Main page ----------
+
+    // Same picks for the whole 6-hour window (local time), a new random set after that.
+    private fun pick(list: List<String>, count: Int, salt: Long): List<String> {
+        if (list.size <= count) return list
+        val now = System.currentTimeMillis()
+        val bucket = (now + java.util.TimeZone.getDefault().getOffset(now)) / rotationMs
+        return list.shuffled(kotlin.random.Random(bucket + salt)).take(count)
+    }
 
     override val mainPage: List<MainPageData>
         get() {
-            val shelves = mutableListOf("all" to "Latest")
-            accounts().forEach { shelves.add("acct:$it" to it) }
+            val shelves = mutableListOf(
+                "priority" to "Priority Latest",
+                "all" to "Latest"
+            )
+            val ctx = CloudStreamApp.context
+            if (ctx != null) {
+                pick(feedPriority(ctx), priorityShelfCount, 1L)
+                    .forEach { shelves.add("acct:$it" to it) }
+                pick(feedAccounts(ctx), otherShelfCount, 2L)
+                    .forEach { shelves.add("acct:$it" to it) }
+            }
             return mainPageOf(*shelves.toTypedArray())
         }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val data = request.data
-        val search = if (data.startsWith("acct:")) "#${data.removePrefix("acct:")}" else "#$syncTag"
+        val search = when {
+            data == "priority" -> "#$priorityTag"
+            data.startsWith("acct:") -> "#${data.removePrefix("acct:")}"
+            else -> "#$syncTag"
+        }
         val items = fetch(search, page - 1, pageSize)
         return newHomePageResponse(
             request.name,
@@ -94,8 +116,16 @@ class RaindropFeedProvider : MainAPI() {
         )
     }
 
-    override suspend fun search(query: String): List<SearchResponse> =
-        fetch("$query #$syncTag", 0, 50).map { it.toTile() }
+    // Typing an account name (with or without @) lists that account's videos;
+    // anything else is a text search over the synced videos.
+    override suspend fun search(query: String): List<SearchResponse> {
+        val q = query.trim().removePrefix("@")
+        val ctx = CloudStreamApp.context
+        val isAccount = ctx != null &&
+            (feedPriority(ctx) + feedAccounts(ctx)).any { it.equals(q, ignoreCase = true) }
+        val search = if (isAccount) "#$q" else "$q #$syncTag"
+        return fetch(search, 0, 50).map { it.toTile() }
+    }
 
     // ---------- Details + playback ----------
 
@@ -118,7 +148,7 @@ class RaindropFeedProvider : MainAPI() {
         ) {
             this.posterUrl = item.cover?.takeIf { it.isNotBlank() }
             this.plot = item.excerpt
-            this.tags = item.tags?.filter { it != syncTag }
+            this.tags = item.tags?.filter { it != syncTag && it != priorityTag }
         }
     }
 
