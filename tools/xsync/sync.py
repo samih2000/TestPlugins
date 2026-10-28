@@ -206,25 +206,31 @@ def find_cursor(node):
     return None
 
 
-def existing_links(token, tag):
-    """All tweet links already saved in Raindrop for this account (used by deep backfill)."""
-    links, page = set(), 0
-    while page < 200:
+def bookmarked_tweet_ids(token):
+    """IDs of every tweet already bookmarked in Raindrop (by hand or by this job).
+
+    Read once per run, so nothing you saved yourself is ever added a second time.
+    """
+    ids, page = set(), 0
+    while page < 400:
         r = requests.get(
             "https://api.raindrop.io/rest/v1/raindrops/0",
             headers={"Authorization": f"Bearer {token}"},
-            params={"search": f"#{tag} #xsync", "perpage": 50, "page": page},
+            params={"perpage": 50, "page": page},
             timeout=30,
         )
         if r.status_code != 200:
-            raise RuntimeError(f"Raindrop HTTP {r.status_code} while listing existing bookmarks")
+            raise RuntimeError(f"Raindrop HTTP {r.status_code} while listing bookmarks")
         items = r.json().get("items", [])
         if not items:
             break
-        links.update(i.get("link", "") for i in items)
+        for i in items:
+            m = re.search(r"status/(\d+)", i.get("link", ""))
+            if m:
+                ids.add(m.group(1))
         page += 1
         time.sleep(0.6)
-    return links
+    return ids
 
 
 def parse_tweet(result, username):
@@ -328,6 +334,9 @@ def main():
     state.setdefault("user_ids", {})
     state.setdefault("seen", {})
 
+    known_ids = bookmarked_tweet_ids(rd_token)
+    log(f"{len(known_ids)} tweets already bookmarked in Raindrop")
+
     x = XClient(x_auth, x_ct0)
     x.discover_query_ids()
 
@@ -355,13 +364,9 @@ def main():
             deep = args.pages > 1
             first_run = key not in state["seen"]
             seen = set(state["seen"].get(key, []))
-            if deep:
-                # Skip anything already in Raindrop so a backfill never creates duplicates.
-                for link in existing_links(rd_token, name):
-                    m = re.search(r"status/(\d+)", link)
-                    if m:
-                        seen.add(m.group(1))
-            new = [t for t in tweets if t["id"] not in seen]
+            # Anything already in Raindrop (even bookmarked by hand) is never added again.
+            skip = seen | known_ids
+            new = [t for t in tweets if t["id"] not in skip]
             if first_run and not deep:
                 new = new[-backfill:]  # newest N only
 
