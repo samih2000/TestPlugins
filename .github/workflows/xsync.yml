@@ -8,6 +8,9 @@ on:
       backfill_pages:
         description: "History depth: pages of ~40 media tweets per account. 0 = normal run"
         default: "0"
+      debug_accounts:
+        description: "Troubleshooting: account names, comma separated. Prints what X returns and saves nothing"
+        default: ""
 
 concurrency:
   group: xsync
@@ -35,6 +38,7 @@ jobs:
           X_AUTH_TOKEN: ${{ secrets.X_AUTH_TOKEN }}
           X_CT0: ${{ secrets.X_CT0 }}
           BACKFILL_PAGES: ${{ github.event.inputs.backfill_pages || '0' }}
+          DEBUG_ACCOUNTS: ${{ github.event.inputs.debug_accounts || '' }}
         run: python tools/xsync/sync.py
 
       - name: Commit state
