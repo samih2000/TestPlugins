@@ -1,0 +1,40 @@
+name: Sync X videos to Raindrop
+
+on:
+  schedule:
+    - cron: "17,47 * * * *"   # every 30 minutes
+  workflow_dispatch: {}
+
+concurrency:
+  group: xsync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      - name: Run sync
+        env:
+          RAINDROP_TOKEN: ${{ secrets.RAINDROP_TOKEN }}
+          X_AUTH_TOKEN: ${{ secrets.X_AUTH_TOKEN }}
+          X_CT0: ${{ secrets.X_CT0 }}
+        run: python tools/xsync/sync.py
+
+      - name: Commit state
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add tools/xsync/state.json
+          git diff --cached --quiet || (git commit -m "xsync state" && git push)
+  
