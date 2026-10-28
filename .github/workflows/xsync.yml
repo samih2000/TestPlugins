@@ -3,7 +3,11 @@ name: Sync X videos to Raindrop
 on:
   schedule:
     - cron: "17,47 * * * *"   # every 30 minutes
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      backfill_pages:
+        description: "History depth: pages of ~40 media tweets per account. 0 = normal run"
+        default: "0"
 
 concurrency:
   group: xsync
@@ -15,6 +19,7 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -29,6 +34,7 @@ jobs:
           RAINDROP_TOKEN: ${{ secrets.RAINDROP_TOKEN }}
           X_AUTH_TOKEN: ${{ secrets.X_AUTH_TOKEN }}
           X_CT0: ${{ secrets.X_CT0 }}
+          BACKFILL_PAGES: ${{ github.event.inputs.backfill_pages || '0' }}
         run: python tools/xsync/sync.py
 
       - name: Commit state
@@ -37,4 +43,3 @@ jobs:
           git config user.email "actions@github.com"
           git add tools/xsync/state.json
           git diff --cached --quiet || (git commit -m "xsync state" && git push)
-  
