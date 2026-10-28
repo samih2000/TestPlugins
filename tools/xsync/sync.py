@@ -265,14 +265,14 @@ def parse_tweet(result, username):
     }
 
 
-def to_raindrop_item(t, username, collection_id):
+def to_raindrop_item(t, username, collection_id, is_priority=False):
     title = (t["text"][:80] + "…") if len(t["text"]) > 80 else t["text"]
     item = {
         "link": t["url"],
         "title": title or f"@{username}",
         "excerpt": t["text"],
         "note": "\n".join(t["videos"]),
-        "tags": [username, "xsync"],
+        "tags": [username, "xsync"] + (["priority"] if is_priority else []),
     }
     if t["thumb"]:
         item["cover"] = t["thumb"]
@@ -308,7 +308,13 @@ def main():
     args = ap.parse_args()
 
     cfg = load_json(CONFIG_PATH, {})
-    accounts = cfg.get("accounts", [])
+    priority = cfg.get("priority", [])
+    priority_set = {a.lower() for a in priority}
+    accounts, listed = [], set()
+    for a in priority + cfg.get("accounts", []):  # priority accounts go first
+        if a.lower() not in listed:
+            listed.add(a.lower())
+            accounts.append(a)
     backfill = args.limit or cfg.get("backfill", 20)
     collection_id = os.environ.get("RAINDROP_COLLECTION_ID") or cfg.get("collection_id")
 
@@ -361,7 +367,10 @@ def main():
 
             log(f"@{name}: {len(tweets)} video tweets fetched, {len(new)} new")
             if new and not args.dry:
-                post_to_raindrop([to_raindrop_item(t, name, collection_id) for t in new], rd_token)
+                post_to_raindrop(
+                    [to_raindrop_item(t, name, collection_id, key in priority_set) for t in new],
+                    rd_token,
+                )
             elif new:
                 for t in new:
                     log(f"  would add {t['url']}  ({len(t['videos'])} video)")
