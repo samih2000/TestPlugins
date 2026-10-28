@@ -84,6 +84,13 @@ def load_json(path, default):
         return default
 
 
+RETRY_MISSING_SECONDS = 7 * 24 * 3600  # re-check suspended / not-found accounts weekly
+
+
+class UserNotFound(RuntimeError):
+    """Account is suspended, deleted or renamed (X reports them all the same way)."""
+
+
 class XClient:
     def __init__(self, auth_token, ct0):
         self.s = requests.Session()
@@ -154,7 +161,7 @@ class XClient:
         })
         rid = data.get("data", {}).get("user", {}).get("result", {}).get("rest_id")
         if not rid:
-            raise RuntimeError(f"@{screen_name}: user not found")
+            raise UserNotFound(f"@{screen_name}: user not found")
         return rid
 
     def media_tweets(self, user_id, count=40, cursor=None):
@@ -333,6 +340,7 @@ def main():
     state = load_json(STATE_PATH, {"user_ids": {}, "seen": {}})
     state.setdefault("user_ids", {})
     state.setdefault("seen", {})
+    state.setdefault("missing", {})  # account -> when it was last found missing
 
     known_ids = bookmarked_tweet_ids(rd_token)
     log(f"{len(known_ids)} tweets already bookmarked in Raindrop")
@@ -343,8 +351,15 @@ def main():
     failures = 0
     for name in accounts:
         key = name.lower()
+        since = state["missing"].get(key)
+        if since and time.time() - since < RETRY_MISSING_SECONDS:
+            days = max(1, round((RETRY_MISSING_SECONDS - (time.time() - since)) / 86400))
+            log(f"@{name}: not found last time, skipped (retrying in ~{days} days)")
+            continue
         try:
             uid = state["user_ids"].get(key) or x.user_id(name)
+            if state["missing"].pop(key, None):
+                log(f"@{name}: is back!")
             state["user_ids"][key] = uid
             collected, cursor = {}, None
             for _ in range(max(1, args.pages)):
@@ -383,6 +398,9 @@ def main():
             if not args.dry:
                 seen.update(t["id"] for t in tweets)  # also marks skipped backfill as seen
                 state["seen"][key] = sorted(seen, key=int)[-500:]
+        except UserNotFound as e:
+            state["missing"][key] = time.time()
+            log(f"@{name}: not found (suspended, deleted or renamed), will re-check in a week")
         except Exception as e:  # noqa: BLE001
             failures += 1
             log(f"@{name}: FAILED - {e}")
