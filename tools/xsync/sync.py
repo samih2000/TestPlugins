@@ -157,8 +157,9 @@ class XClient:
             raise RuntimeError(f"@{screen_name}: user not found")
         return rid
 
-    def media_tweets(self, user_id, count=40):
-        data = self.gql("UserMedia", {
+    def media_tweets(self, user_id, count=40, cursor=None):
+        """Returns (tweet results, cursor for the next older page or None)."""
+        variables = {
             "userId": user_id,
             "count": count,
             "includePromotedContent": False,
@@ -166,8 +167,11 @@ class XClient:
             "withBirdwatchNotes": False,
             "withVoice": True,
             "withV2Timeline": True,
-        })
-        return list(iter_tweets(data))
+        }
+        if cursor:
+            variables["cursor"] = cursor
+        data = self.gql("UserMedia", variables)
+        return list(iter_tweets(data)), find_cursor(data)
 
 
 def iter_tweets(node):
@@ -183,6 +187,44 @@ def iter_tweets(node):
     elif isinstance(node, list):
         for v in node:
             yield from iter_tweets(v)
+
+
+def find_cursor(node):
+    """Finds the 'Bottom' cursor that points at the next (older) page of the timeline."""
+    if isinstance(node, dict):
+        if node.get("cursorType") == "Bottom" and node.get("value"):
+            return node["value"]
+        for v in node.values():
+            c = find_cursor(v)
+            if c:
+                return c
+    elif isinstance(node, list):
+        for v in node:
+            c = find_cursor(v)
+            if c:
+                return c
+    return None
+
+
+def existing_links(token, tag):
+    """All tweet links already saved in Raindrop for this account (used by deep backfill)."""
+    links, page = set(), 0
+    while page < 200:
+        r = requests.get(
+            "https://api.raindrop.io/rest/v1/raindrops/0",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"search": f"#{tag} #xsync", "perpage": 50, "page": page},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"Raindrop HTTP {r.status_code} while listing existing bookmarks")
+        items = r.json().get("items", [])
+        if not items:
+            break
+        links.update(i.get("link", "") for i in items)
+        page += 1
+        time.sleep(0.6)
+    return links
 
 
 def parse_tweet(result, username):
@@ -259,6 +301,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry", action="store_true", help="print what would be added, change nothing")
     ap.add_argument("--limit", type=int, default=None, help="override the first-run backfill size")
+    ap.add_argument(
+        "--pages", type=int, default=int(os.environ.get("BACKFILL_PAGES") or 0),
+        help="history depth: pages of ~40 media tweets per account (0/1 = normal run)",
+    )
     args = ap.parse_args()
 
     cfg = load_json(CONFIG_PATH, {})
@@ -285,15 +331,32 @@ def main():
         try:
             uid = state["user_ids"].get(key) or x.user_id(name)
             state["user_ids"][key] = uid
-            tweets = [parse_tweet(r, name) for r in x.media_tweets(uid)]
-            tweets = sorted(
-                {t["id"]: t for t in tweets if t}.values(), key=lambda t: int(t["id"])
-            )
+            collected, cursor = {}, None
+            for _ in range(max(1, args.pages)):
+                batch, nxt = x.media_tweets(uid, cursor=cursor)
+                if not batch:
+                    break
+                for r in batch:
+                    t = parse_tweet(r, name)
+                    if t:
+                        collected[t["id"]] = t
+                if not nxt or nxt == cursor:
+                    break
+                cursor = nxt
+                time.sleep(2)
+            tweets = sorted(collected.values(), key=lambda t: int(t["id"]))
 
+            deep = args.pages > 1
             first_run = key not in state["seen"]
             seen = set(state["seen"].get(key, []))
+            if deep:
+                # Skip anything already in Raindrop so a backfill never creates duplicates.
+                for link in existing_links(rd_token, name):
+                    m = re.search(r"status/(\d+)", link)
+                    if m:
+                        seen.add(m.group(1))
             new = [t for t in tweets if t["id"] not in seen]
-            if first_run:
+            if first_run and not deep:
                 new = new[-backfill:]  # newest N only
 
             log(f"@{name}: {len(tweets)} video tweets fetched, {len(new)} new")
