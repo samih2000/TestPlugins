@@ -9,11 +9,13 @@ Env vars: RAINDROP_TOKEN, X_AUTH_TOKEN, X_CT0
 Usage:    python sync.py [--dry] [--limit N]
 """
 import argparse
+import collections
 import json
 import os
 import re
 import sys
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -92,6 +94,8 @@ class UserNotFound(RuntimeError):
 
 
 class XClient:
+    last_diag = ""
+
     def __init__(self, auth_token, ct0):
         self.s = requests.Session()
         self.s.headers.update({
@@ -164,6 +168,23 @@ class XClient:
             raise UserNotFound(f"@{screen_name}: user not found")
         return rid
 
+    def user_info(self, screen_name):
+        """Profile facts that explain an empty media timeline (only used for diagnostics)."""
+        data = self.gql("UserByScreenName", {
+            "screen_name": screen_name,
+            "withSafetyModeUserFields": True,
+        })
+        res = data.get("data", {}).get("user", {}).get("result", {}) or {}
+        legacy = res.get("legacy") or {}
+        return {
+            "type": res.get("__typename"),
+            "protected": (res.get("privacy") or {}).get("protected", legacy.get("protected")),
+            "media_count": legacy.get("media_count"),
+            "statuses": legacy.get("statuses_count"),
+            "interstitial": legacy.get("profile_interstitial_type"),
+            "you_follow": (res.get("relationship_perspectives") or {}).get("following"),
+        }
+
     def media_tweets(self, user_id, count=40, cursor=None):
         """Returns (tweet results, cursor for the next older page or None)."""
         variables = {
@@ -178,7 +199,9 @@ class XClient:
         if cursor:
             variables["cursor"] = cursor
         data = self.gql("UserMedia", variables)
-        return list(iter_tweets(data)), find_cursor(data)
+        results = list(iter_tweets(data))
+        self.last_diag = describe_timeline(data, results)
+        return results, find_cursor(data)
 
 
 def iter_tweets(node):
@@ -194,6 +217,43 @@ def iter_tweets(node):
     elif isinstance(node, list):
         for v in node:
             yield from iter_tweets(v)
+
+
+def find_key(node, key):
+    if isinstance(node, dict):
+        if key in node:
+            return node[key]
+        for v in node.values():
+            found = find_key(v, key)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for v in node:
+            found = find_key(v, key)
+            if found is not None:
+                return found
+    return None
+
+
+def describe_timeline(data, results):
+    """One-line summary of what X returned, for logs when an account yields no videos."""
+    media_types, mp4 = Counter(), 0
+    for r in results:
+        legacy = r.get("legacy") or {}
+        for m in (legacy.get("extended_entities") or {}).get("media", []):
+            media_types[m.get("type")] += 1
+            variants = (m.get("video_info") or {}).get("variants", [])
+            if any(v.get("content_type") == "video/mp4" for v in variants):
+                mp4 += 1
+    instructions = find_key(data, "instructions") or []
+    entries = sum(len(i.get("entries", [])) for i in instructions if isinstance(i, dict))
+    errors = [e.get("message") for e in (data.get("errors") or [])][:2]
+    return (
+        f"tweets={len(results)} with_legacy={sum(1 for r in results if r.get('legacy'))} "
+        f"media={dict(media_types)} mp4={mp4} entries={entries} "
+        f"instructions={[i.get('type') for i in instructions if isinstance(i, dict)]} "
+        f"errors={errors}"
+    )
 
 
 def find_cursor(node):
@@ -278,6 +338,81 @@ def parse_tweet(result, username):
     }
 
 
+def debug_accounts(x, names):
+    """Prints what X returns for each account, to find out why a media tab comes back empty.
+
+    Prints structure and counts only: no cookies, no tokens, no raw tweet text.
+    """
+    for name in names:
+        log(f"=== debug @{name} ===")
+        try:
+            data = x.gql("UserByScreenName", {"screen_name": name, "withSafetyModeUserFields": True})
+            user = ((data.get("data") or {}).get("user") or {}).get("result") or {}
+            legacy = user.get("legacy") or {}
+            log(f"user type: {user.get('__typename')}  reason: {user.get('reason')}")
+            log(
+                f"media_count={legacy.get('media_count')}  statuses={legacy.get('statuses_count')}  "
+                f"protected={legacy.get('protected') or (user.get('privacy') or {}).get('protected')}  "
+                f"possibly_sensitive={legacy.get('possibly_sensitive')}  "
+                f"interstitial={user.get('profile_interstitial_type') or legacy.get('profile_interstitial_type')}"
+            )
+            persp = user.get("relationship_perspectives") or {}
+            log(f"relationship: { {k: v for k, v in persp.items()} }  "
+                f"blocked_by={legacy.get('blocked_by')}  blocking={legacy.get('blocking')}")
+            uid = user.get("rest_id")
+            if not uid:
+                log("no user id -> account not visible to this X login")
+                continue
+
+            media = x.gql("UserMedia", {
+                "userId": uid, "count": 40, "includePromotedContent": False,
+                "withClientEventToken": False, "withBirdwatchNotes": False,
+                "withVoice": True, "withV2Timeline": True,
+            })
+            errs = media.get("errors")
+            log(f"graphql errors: {[e.get('message') for e in errs] if errs else None}")
+
+            lists = []
+            find_lists(media, "instructions", lists)
+            for ins in (lists[0] if lists else []):
+                entries = ins.get("entries") or []
+                ids = [str(e.get("entryId", "?"))[:22] for e in entries[:6]]
+                log(f"instruction {ins.get('type')}: {len(entries)} entries {ids}")
+
+            results = list(iter_tweets(media))
+            kinds = collections.Counter(r.get("__typename") for r in results)
+            log(f"tweet results: {len(results)}  types: {dict(kinds)}")
+            for r in results[:12]:
+                lg = r.get("legacy") or {}
+                ext = (lg.get("extended_entities") or {}).get("media") or []
+                ent = (lg.get("entities") or {}).get("media") or []
+                log(
+                    f"  {r.get('rest_id')} {r.get('__typename')} "
+                    f"sensitive={lg.get('possibly_sensitive')} "
+                    f"ext_media={[m.get('type') for m in ext]} "
+                    f"has_video_url={[bool((m.get('video_info') or {}).get('variants')) for m in ext]} "
+                    f"entities_media={len(ent)} "
+                    f"retweet={'retweeted_status_result' in lg} "
+                    f"warning={[bool(m.get('sensitive_media_warning') or m.get('ext_sensitive_media_warning')) for m in ext]} "
+                    f"tombstone={((r.get('tombstone') or {}).get('text') or {}).get('text')}"
+                )
+        except Exception as e:  # noqa: BLE001
+            log(f"debug failed: {e}")
+        time.sleep(3)
+
+
+def find_lists(node, key, out):
+    """Collects every list stored under `key` anywhere in the JSON."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == key and isinstance(v, list):
+                out.append(v)
+            find_lists(v, key, out)
+    elif isinstance(node, list):
+        for v in node:
+            find_lists(v, key, out)
+
+
 def to_raindrop_item(t, username, collection_id, is_priority=False):
     title = (t["text"][:80] + "…") if len(t["text"]) > 80 else t["text"]
     item = {
@@ -318,7 +453,20 @@ def main():
         "--pages", type=int, default=int(os.environ.get("BACKFILL_PAGES") or 0),
         help="history depth: pages of ~40 media tweets per account (0/1 = normal run)",
     )
+    ap.add_argument(
+        "--debug", default=os.environ.get("DEBUG_ACCOUNTS", ""),
+        help="comma separated account names: print what X returns for them, then stop",
+    )
     args = ap.parse_args()
+
+    debug_names = [n.strip().lstrip("@") for n in args.debug.split(",") if n.strip()]
+    if debug_names:
+        if not (os.environ.get("X_AUTH_TOKEN") and os.environ.get("X_CT0")):
+            sys.exit("Set X_AUTH_TOKEN and X_CT0")
+        dbg = XClient(os.environ["X_AUTH_TOKEN"], os.environ["X_CT0"])
+        dbg.discover_query_ids()
+        debug_accounts(dbg, debug_names)
+        return
 
     cfg = load_json(CONFIG_PATH, {})
     priority = cfg.get("priority", [])
@@ -386,6 +534,12 @@ def main():
                 new = new[-backfill:]  # newest N only
 
             log(f"@{name}: {len(tweets)} video tweets fetched, {len(new)} new")
+            if not tweets:
+                log("  diag: " + (x.last_diag or "no timeline response"))
+                try:
+                    log("  user: " + json.dumps(x.user_info(name), default=str))
+                except Exception as e:  # noqa: BLE001
+                    log(f"  user info failed: {e}")
             if new and not args.dry:
                 post_to_raindrop(
                     [to_raindrop_item(t, name, collection_id, key in priority_set) for t in new],
