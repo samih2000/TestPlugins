@@ -105,7 +105,8 @@ class RaindropFeedProvider : MainAPI() {
         val data = request.data
         val search = when {
             data == "priority" -> "#$priorityTag"
-            data.startsWith("acct:") -> "#${data.removePrefix("acct:")}"
+            // "#xsync" too, so older hand-saved bookmarks that share the account tag stay out.
+            data.startsWith("acct:") -> "#$syncTag #${data.removePrefix("acct:")}"
             else -> "#$syncTag"
         }
         val items = fetch(search, page - 1, pageSize)
@@ -123,7 +124,7 @@ class RaindropFeedProvider : MainAPI() {
         val ctx = CloudStreamApp.context
         val isAccount = ctx != null &&
             (feedPriority(ctx) + feedAccounts(ctx)).any { it.equals(q, ignoreCase = true) }
-        val search = if (isAccount) "#$q" else "$q #$syncTag"
+        val search = if (isAccount) "#$syncTag #$q" else "$q #$syncTag"
         return fetch(search, 0, 50).map { it.toTile() }
     }
 
