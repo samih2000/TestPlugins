@@ -40,6 +40,13 @@ UA = (
 QUERY_IDS = {
     "UserByScreenName": "xc8f1g7BYqr6VTzTbvNlGw",
     "UserMedia": "dexO_2tohK86JDudXXG3Yw",
+    # Posts tab. Only used when the media tab comes back empty. Best-guess id; if X's bundle
+    # has a newer one, discover_query_ids() replaces it.
+    "UserTweets": "E3opETHurmVJflFsUBVuUQ",
+}
+# Older ids tried in turn if the one above answers 404.
+ALT_QUERY_IDS = {
+    "UserTweets": ["V7H0Ap3_Hh2FyS75OCDO3Q", "Y9WM4Id6UcGFE8Z-hbnixw"],
 }
 
 FEATURES = {k: False for k in [
@@ -118,13 +125,15 @@ class XClient:
             bundles = re.findall(
                 r'https://abs\.twimg\.com/responsive-web/client-web[^"\']*?\.js', html
             )
+            found = set()
             for url in bundles:
                 js = self.s.get(url, timeout=30).text
                 for op in self.ids:
                     m = re.search(r'queryId:"([\w-]+)",operationName:"%s"' % op, js)
                     if m:
                         self.ids[op] = m.group(1)
-            log(f"query ids: {self.ids}")
+                        found.add(op)
+            log(f"query ids: {self.ids}  (read from X's bundle: {sorted(found) or 'none'})")
         except Exception as e:  # noqa: BLE001
             log(f"query id discovery failed ({e}); using fallbacks")
 
@@ -203,6 +212,34 @@ class XClient:
         results = list(iter_tweets(data))
         self.last_diag = describe_timeline(data, results)
         return results, find_cursor(data)
+
+    def posts_tweets(self, user_id, count=40, cursor=None):
+        """The profile's Posts tab. Same (results, next cursor) shape as media_tweets()."""
+        variables = {
+            "userId": user_id,
+            "count": count,
+            "includePromotedContent": False,
+            "withQuickPromoteEligibilityTweetFields": True,
+            "withVoice": True,
+            "withV2Timeline": True,
+        }
+        if cursor:
+            variables["cursor"] = cursor
+        candidates = [self.ids["UserTweets"]] + [
+            i for i in ALT_QUERY_IDS.get("UserTweets", []) if i != self.ids["UserTweets"]
+        ]
+        last = None
+        for qid in candidates:
+            self.ids["UserTweets"] = qid
+            try:
+                data = self.gql("UserTweets", variables)
+            except RuntimeError as e:
+                if "stale" in str(e):  # 404: try the next known id
+                    last = e
+                    continue
+                raise
+            return list(iter_tweets(data)), find_cursor(data)
+        raise last or RuntimeError("UserTweets: no usable query id")
 
 
 def iter_tweets(node):
@@ -411,9 +448,75 @@ def debug_accounts(x, names):
                     break
                 cursor = nxt
                 time.sleep(2)
+
+            # Same check on the Posts tab, which X may filter differently from the media tab.
+            cursor = None
+            for page in range(1, 4):
+                try:
+                    results, nxt = x.posts_tweets(uid, cursor=cursor)
+                except Exception as e:  # noqa: BLE001
+                    log(f"posts tab page {page}: failed - {e}")
+                    break
+                own = [
+                    r for r in results
+                    if (r.get("legacy") or {}).get("user_id_str") == uid
+                    and "retweeted_status_result" not in (r.get("legacy") or {})
+                ]
+                with_video = sum(1 for r in own if parse_tweet(r, name))
+                kinds = collections.Counter(r.get("__typename") for r in results)
+                log(
+                    f"posts tab page {page}: tweets={len(results)} own={len(own)} "
+                    f"with_video={with_video} types={dict(kinds)} "
+                    f"next_cursor={'yes' if nxt else 'no'}"
+                )
+                if page == 1:
+                    for r in results[:5]:
+                        lg = r.get("legacy") or {}
+                        ext = (lg.get("extended_entities") or {}).get("media") or []
+                        log(
+                            f"  {r.get('rest_id')} {r.get('__typename')} "
+                            f"sensitive={lg.get('possibly_sensitive')} "
+                            f"ext_media={[m.get('type') for m in ext]} "
+                            f"has_video_url={[bool((m.get('video_info') or {}).get('variants')) for m in ext]} "
+                            f"retweet={'retweeted_status_result' in lg} "
+                            f"tombstone={((r.get('tombstone') or {}).get('text') or {}).get('text')}"
+                        )
+                if not nxt or nxt == cursor:
+                    break
+                cursor = nxt
+                time.sleep(2)
         except Exception as e:  # noqa: BLE001
             log(f"debug failed: {e}")
         time.sleep(3)
+
+
+POSTS_FALLBACK_PAGES = 3
+
+
+def posts_fallback(x, uid, name, want_pages):
+    """Videos from the Posts tab, for accounts whose media tab comes back empty.
+
+    Only the account's own tweets count (retweets and other people's replies are skipped).
+    """
+    found, cursor = {}, None
+    for _ in range(max(POSTS_FALLBACK_PAGES, want_pages)):
+        try:
+            batch, nxt = x.posts_tweets(uid, cursor=cursor)
+        except Exception as e:  # noqa: BLE001
+            log(f"  posts-tab fallback failed: {e}")
+            break
+        for r in batch:
+            lg = r.get("legacy") or {}
+            if lg.get("user_id_str") != uid or "retweeted_status_result" in lg:
+                continue
+            t = parse_tweet(r, name)
+            if t:
+                found[t["id"]] = t
+        if not nxt or nxt == cursor:
+            break
+        cursor = nxt
+        time.sleep(2)
+    return found
 
 
 def find_lists(node, key, out):
@@ -543,6 +646,12 @@ def main():
                     break
                 cursor = nxt
                 time.sleep(2)
+            if useful == 0:
+                # Media tab gave nothing at all: try the Posts tab before giving up on the account.
+                alt = posts_fallback(x, uid, name, want)
+                if alt:
+                    log(f"@{name}: media tab was empty, found {len(alt)} videos on the posts tab")
+                    collected.update(alt)
             tweets = sorted(collected.values(), key=lambda t: int(t["id"]))
 
             deep = args.pages > 1
