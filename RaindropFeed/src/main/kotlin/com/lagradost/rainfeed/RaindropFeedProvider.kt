@@ -9,13 +9,16 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import java.net.URLEncoder
 
 /**
- * v2: nothing is looked up on X from the phone. The sync job (tools/xsync) stores everything
- * the plugin needs inside each Raindrop bookmark:
+ * v2: nothing is looked up on X from the phone for tiles. The sync job (tools/xsync) stores
+ * everything the plugin needs inside each Raindrop bookmark:
  *   cover   -> thumbnail (tile poster)
  *   note    -> direct video URL(s), one per line
  *   excerpt -> tweet text
  *   tags    -> account name + "xsync" (+ "priority" for priority accounts)
  * so tiles and playback are a single Raindrop request each.
+ *
+ * Backup: if a bookmark has no stored video link, loadLinks asks vxtwitter, then FxTwitter,
+ * for that one tweet. One request per tap, so no rate-limit problem.
  *
  * Home page: "Priority Latest", "Latest", then 5 random priority accounts and 5 random
  * other accounts. The random picks stay the same for 6 hours, then change.
@@ -55,7 +58,22 @@ class RaindropFeedProvider : MainAPI() {
 
     data class FeedResponse(val items: List<FeedItem>, val count: Int)
 
+    // Backup lookup shapes (vxtwitter and FxTwitter). Unknown fields are ignored.
+    data class VxMedia(val type: String?, val url: String?)
+    data class VxTweet(@JsonProperty("media_extended") val mediaExtended: List<VxMedia>?)
+    data class FxVideo(val url: String?)
+    data class FxMedia(val videos: List<FxVideo>?)
+    data class FxTweetBody(val media: FxMedia?)
+    data class FxResponse(val tweet: FxTweetBody?)
+
     private val tweetIdRegex = Regex("status/(\\d+)")
+    private val tweetRegex =
+        Regex("(?:x|twitter|vxtwitter|fxtwitter|fixupx|fixvx)\\.com/([^/?#]+)/status/(\\d+)")
+
+    private val backupHeaders = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+    )
 
     // Raindrop search: "#tag" filters by tag, a bare word searches text.
     private suspend fun fetch(search: String, page: Int, perPage: Int): List<FeedItem> {
@@ -153,17 +171,56 @@ class RaindropFeedProvider : MainAPI() {
         }
     }
 
+    // Backup: ask vxtwitter, then FxTwitter, for this one tweet's video link(s).
+    private suspend fun backupVideoUrls(tweetUrl: String): List<String> {
+        val m = tweetRegex.find(tweetUrl) ?: return emptyList()
+        val (username, tweetId) = m.destructured
+
+        try {
+            val vx = app.get(
+                "https://api.vxtwitter.com/$username/status/$tweetId",
+                headers = backupHeaders,
+                timeout = 8L
+            ).parsedSafe<VxTweet>()
+            val urls = vx?.mediaExtended
+                ?.filter { it.type == "video" || it.type == "gif" }
+                ?.mapNotNull { it.url?.takeIf { u -> u.startsWith("http") } }
+                .orEmpty()
+            if (urls.isNotEmpty()) return urls
+        } catch (e: Exception) {
+            // fall through to FxTwitter
+        }
+
+        try {
+            val fx = app.get(
+                "https://api.fxtwitter.com/$username/status/$tweetId",
+                headers = backupHeaders,
+                timeout = 8L
+            ).parsedSafe<FxResponse>()
+            val urls = fx?.tweet?.media?.videos
+                ?.mapNotNull { it.url?.takeIf { u -> u.startsWith("http") } }
+                .orEmpty()
+            if (urls.isNotEmpty()) return urls
+        } catch (e: Exception) {
+            // nothing left to try
+        }
+        return emptyList()
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val urls = findItem(data)?.note
+        val stored = findItem(data)?.note
             ?.lines()
             ?.map { it.trim() }
             ?.filter { it.startsWith("http") }
             .orEmpty()
+
+        // Use the stored links; only if there are none, ask vxtwitter / FxTwitter.
+        val urls = stored.ifEmpty { backupVideoUrls(data) }
         if (urls.isEmpty()) return false
 
         urls.forEachIndexed { i, videoUrl ->
