@@ -646,11 +646,12 @@ def main():
                     break
                 cursor = nxt
                 time.sleep(2)
-            if useful == 0:
-                # Media tab gave nothing at all: try the Posts tab before giving up on the account.
+            if not collected:
+                # The media tab gave no videos (empty, or photos only: X can hide an account's
+                # videos there). Try the Posts tab before giving up on the account.
                 alt = posts_fallback(x, uid, name, want)
                 if alt:
-                    log(f"@{name}: media tab was empty, found {len(alt)} videos on the posts tab")
+                    log(f"@{name}: media tab had no videos, found {len(alt)} on the posts tab")
                     collected.update(alt)
             tweets = sorted(collected.values(), key=lambda t: int(t["id"]))
 
