@@ -87,6 +87,7 @@ def load_json(path, default):
 
 
 RETRY_MISSING_SECONDS = 7 * 24 * 3600  # re-check suspended / not-found accounts weekly
+MAX_EMPTY_PAGES = 5  # empty timeline pages to skip over before giving up on an account
 
 
 class UserNotFound(RuntimeError):
@@ -364,38 +365,52 @@ def debug_accounts(x, names):
                 log("no user id -> account not visible to this X login")
                 continue
 
-            media = x.gql("UserMedia", {
-                "userId": uid, "count": 40, "includePromotedContent": False,
-                "withClientEventToken": False, "withBirdwatchNotes": False,
-                "withVoice": True, "withV2Timeline": True,
-            })
-            errs = media.get("errors")
-            log(f"graphql errors: {[e.get('message') for e in errs] if errs else None}")
-
-            lists = []
-            find_lists(media, "instructions", lists)
-            for ins in (lists[0] if lists else []):
-                entries = ins.get("entries") or []
-                ids = [str(e.get("entryId", "?"))[:22] for e in entries[:6]]
-                log(f"instruction {ins.get('type')}: {len(entries)} entries {ids}")
-
-            results = list(iter_tweets(media))
-            kinds = collections.Counter(r.get("__typename") for r in results)
-            log(f"tweet results: {len(results)}  types: {dict(kinds)}")
-            for r in results[:12]:
-                lg = r.get("legacy") or {}
-                ext = (lg.get("extended_entities") or {}).get("media") or []
-                ent = (lg.get("entities") or {}).get("media") or []
+            # Follow the "next page" cursor for up to 6 pages: X sometimes sends an empty
+            # first page (only cursors) and the real tweets come on the pages after it.
+            cursor, listed = None, False
+            for page in range(1, 7):
+                variables = {
+                    "userId": uid, "count": 40, "includePromotedContent": False,
+                    "withClientEventToken": False, "withBirdwatchNotes": False,
+                    "withVoice": True, "withV2Timeline": True,
+                }
+                if cursor:
+                    variables["cursor"] = cursor
+                media = x.gql("UserMedia", variables)
+                errs = media.get("errors")
+                results = list(iter_tweets(media))
+                with_video = sum(1 for r in results if parse_tweet(r, name))
+                nxt = find_cursor(media)
+                kinds = collections.Counter(r.get("__typename") for r in results)
                 log(
-                    f"  {r.get('rest_id')} {r.get('__typename')} "
-                    f"sensitive={lg.get('possibly_sensitive')} "
-                    f"ext_media={[m.get('type') for m in ext]} "
-                    f"has_video_url={[bool((m.get('video_info') or {}).get('variants')) for m in ext]} "
-                    f"entities_media={len(ent)} "
-                    f"retweet={'retweeted_status_result' in lg} "
-                    f"warning={[bool(m.get('sensitive_media_warning') or m.get('ext_sensitive_media_warning')) for m in ext]} "
-                    f"tombstone={((r.get('tombstone') or {}).get('text') or {}).get('text')}"
+                    f"page {page}: tweets={len(results)} with_video={with_video} "
+                    f"types={dict(kinds)} next_cursor={'yes' if nxt else 'no'} "
+                    f"errors={[e.get('message') for e in errs] if errs else None}"
                 )
+                if page == 1:
+                    lists = []
+                    find_lists(media, "instructions", lists)
+                    for ins in (lists[0] if lists else []):
+                        entries = ins.get("entries") or []
+                        ids = [str(e.get("entryId", "?"))[:22] for e in entries[:6]]
+                        log(f"  instruction {ins.get('type')}: {len(entries)} entries {ids}")
+                if results and not listed:
+                    listed = True
+                    for r in results[:6]:
+                        lg = r.get("legacy") or {}
+                        ext = (lg.get("extended_entities") or {}).get("media") or []
+                        log(
+                            f"  {r.get('rest_id')} {r.get('__typename')} "
+                            f"sensitive={lg.get('possibly_sensitive')} "
+                            f"ext_media={[m.get('type') for m in ext]} "
+                            f"has_video_url={[bool((m.get('video_info') or {}).get('variants')) for m in ext]} "
+                            f"retweet={'retweeted_status_result' in lg} "
+                            f"tombstone={((r.get('tombstone') or {}).get('text') or {}).get('text')}"
+                        )
+                if not nxt or nxt == cursor:
+                    break
+                cursor = nxt
+                time.sleep(2)
         except Exception as e:  # noqa: BLE001
             log(f"debug failed: {e}")
         time.sleep(3)
@@ -509,15 +524,21 @@ def main():
             if state["missing"].pop(key, None):
                 log(f"@{name}: is back!")
             state["user_ids"][key] = uid
+            # X can answer with an empty page that only holds paging cursors (the tweets come
+            # on the pages after it), so an empty page is skipped over, not treated as the end.
             collected, cursor = {}, None
-            for _ in range(max(1, args.pages)):
+            want, useful, empty = max(1, args.pages), 0, 0
+            while useful < want and empty <= MAX_EMPTY_PAGES:
                 batch, nxt = x.media_tweets(uid, cursor=cursor)
-                if not batch:
-                    break
-                for r in batch:
-                    t = parse_tweet(r, name)
-                    if t:
-                        collected[t["id"]] = t
+                if batch:
+                    useful += 1
+                    empty = 0
+                    for r in batch:
+                        t = parse_tweet(r, name)
+                        if t:
+                            collected[t["id"]] = t
+                else:
+                    empty += 1
                 if not nxt or nxt == cursor:
                     break
                 cursor = nxt
