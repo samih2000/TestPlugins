@@ -20,7 +20,38 @@ SEARCH_QUERY_ID = "3fEctOs2-FvTB7_mvm1hrQ"  # copied from x.com's own search req
 EMPTY_PAGES_ALLOWED = 3
 
 
+_ct = None  # x-client-transaction-id generator, built once
+
+
+def init_transaction_ids():
+    """X's search endpoint answers 404 unless the request carries a signed
+    x-client-transaction-id header (a value the website computes in JavaScript).
+    The 'x-client-transaction' package re-creates it. Optional: if it is missing or
+    breaks, the script still runs and says so (search will most likely 404 then).
+    """
+    global _ct
+    try:
+        import bs4
+        import requests
+        from x_client_transaction import ClientTransaction
+        from x_client_transaction.utils import (
+            generate_headers, get_ondemand_file_url, handle_x_migration,
+        )
+        s = requests.Session()
+        s.headers = generate_headers()
+        home = handle_x_migration(s)
+        url = get_ondemand_file_url(response=home)
+        js = bs4.BeautifulSoup(s.get(url, timeout=30).content, "html.parser")
+        _ct = ClientTransaction(home_page_response=home, ondemand_file_response=js)
+        sync.log("transaction id generator: ready")
+    except Exception as e:  # noqa: BLE001
+        _ct = None
+        sync.log(f"transaction id generator: NOT available ({type(e).__name__}: {e})")
+
+
 def search_page(x, query, cursor=None, count=40):
+    """One page of search results as (tweet results, next cursor). Same request shape as
+    sync.XClient.gql, plus the transaction-id header and a readable error on failure."""
     variables = {
         "rawQuery": query,
         "count": count,
@@ -29,8 +60,44 @@ def search_page(x, query, cursor=None, count=40):
     }
     if cursor:
         variables["cursor"] = cursor
-    data = x.gql("SearchTimeline", variables)
-    return list(sync.iter_tweets(data)), sync.find_cursor(data)
+    path = f"/i/api/graphql/{x.ids['SearchTimeline']}/SearchTimeline"
+    for _ in range(4):
+        headers = {}
+        if _ct is not None:
+            headers["x-client-transaction-id"] = _ct.generate_transaction_id(
+                method="GET", path=path
+            )
+        r = x.s.get(
+            "https://x.com" + path,
+            params={
+                "variables": sync.json.dumps(variables, separators=(",", ":")),
+                "features": sync.json.dumps(x.features, separators=(",", ":")),
+                "fieldToggles": sync.json.dumps({"withArticlePlainText": False}),
+            },
+            headers=headers,
+            timeout=30,
+        )
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"SearchTimeline HTTP {r.status_code} "
+                f"(transaction id sent: {'yes' if _ct is not None else 'no'}) "
+                f"body: {r.text[:200]!r}"
+            )
+        data = r.json()
+        errs = data.get("errors") or []
+        missing = []
+        for e in errs:
+            m = sync.re.search(r"features cannot be null: ([\w, ]+)", e.get("message", ""))
+            if m:
+                missing += [k.strip() for k in m.group(1).split(",")]
+        if missing:  # X names the feature flags it wants; add them and retry
+            for k in missing:
+                x.features[k] = True
+            continue
+        if errs and not data.get("data"):
+            raise RuntimeError(f"SearchTimeline: {errs[0].get('message')}")
+        return list(sync.iter_tweets(data)), sync.find_cursor(data)
+    raise RuntimeError("SearchTimeline: gave up after retries")
 
 
 def main():
@@ -67,6 +134,7 @@ def main():
 
     x = sync.XClient(x_auth, x_ct0)
     x.ids["SearchTimeline"] = SEARCH_QUERY_ID  # no bundle discovery: it finds nothing anyway
+    init_transaction_ids()
 
     total_added = 0
     failures = 0
@@ -121,8 +189,8 @@ def main():
                 sync.log("rate limited: stopping here. Run again later with fewer accounts or pages.")
                 break
             if "HTTP 404" in msg or "HTTP 403" in msg:
-                sync.log("  hint: X may be refusing search calls from a script (missing "
-                         "x-client-transaction-id header) or the query id changed.")
+                sync.log("  hint: 404 usually means a missing/invalid x-client-transaction-id, "
+                         "less often a changed query id.")
                 if failures >= 2:
                     break
         time.sleep(6)
