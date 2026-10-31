@@ -46,7 +46,11 @@ def init_transaction_ids():
         sync.log("transaction id generator: ready")
     except Exception as e:  # noqa: BLE001
         _ct = None
+        import traceback
         sync.log(f"transaction id generator: NOT available ({type(e).__name__}: {e})")
+        # Last frames show which line of the package (or of this script) failed.
+        for line in traceback.format_exc().strip().splitlines()[-8:]:
+            sync.log("    " + line)
 
 
 def search_page(x, query, cursor=None, count=40):
