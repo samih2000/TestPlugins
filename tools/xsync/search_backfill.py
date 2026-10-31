@@ -23,7 +23,7 @@ EMPTY_PAGES_ALLOWED = 3
 _ct = None  # x-client-transaction-id generator, built once
 
 
-def init_transaction_ids():
+def init_transaction_ids(x):
     """X's search endpoint answers 404 unless the request carries a signed
     x-client-transaction-id header (a value the website computes in JavaScript).
     The 'x-client-transaction' package re-creates it. Optional: if it is missing or
@@ -39,7 +39,15 @@ def init_transaction_ids():
         )
         s = requests.Session()
         s.headers = generate_headers()
+        # Logged-out requests from a datacenter get a stripped-down page without the
+        # script list the package reads. Sending the login cookies gets the real app page.
+        s.headers["cookie"] = x.s.headers.get("cookie", "")
         home = handle_x_migration(s)
+        text = str(home)
+        title = home.title.string if home.title else None
+        sync.log(f"x.com page: {len(text)} chars, title={title!r}, "
+                 f"'ondemand' mentions={text.count('ondemand')}, "
+                 f"client-web scripts={text.count('abs.twimg.com/responsive-web/client-web')}")
         url = get_ondemand_file_url(response=home)
         js = bs4.BeautifulSoup(s.get(url, timeout=30).content, "html.parser")
         _ct = ClientTransaction(home_page_response=home, ondemand_file_response=js)
@@ -138,7 +146,7 @@ def main():
 
     x = sync.XClient(x_auth, x_ct0)
     x.ids["SearchTimeline"] = SEARCH_QUERY_ID  # no bundle discovery: it finds nothing anyway
-    init_transaction_ids()
+    init_transaction_ids(x)
 
     total_added = 0
     failures = 0
