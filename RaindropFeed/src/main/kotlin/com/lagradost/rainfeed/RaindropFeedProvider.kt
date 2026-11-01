@@ -7,6 +7,10 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import java.net.URLEncoder
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import org.json.JSONObject
 
 /**
  * v2: nothing is looked up on X from the phone for tiles. The sync job (tools/xsync) stores
@@ -92,7 +96,33 @@ class RaindropFeedProvider : MainAPI() {
         ) {
             this.posterUrl = cover?.takeIf { it.isNotBlank() }
         }
+    // ---------- Account lists (downloaded from accounts.json in the repo) ----------
 
+    private val configTtlMs = 60L * 60L * 1000L
+
+    private suspend fun refreshAccountsIfStale() {
+        val ctx = CloudStreamApp.context ?: return
+        val prefs = feedPrefs(ctx)
+        val age = System.currentTimeMillis() - prefs.getLong(FEED_CONFIG_TS_KEY, 0L)
+        if (age < configTtlMs && feedPriority(ctx).isNotEmpty()) return
+        try {
+            val res = app.get(ACCOUNTS_URL, timeout = 10L)
+            if (res.code != 200) return
+            val obj = JSONObject(res.text)
+            if (obj.optJSONArray("priority") == null && obj.optJSONArray("accounts") == null) return
+            prefs.edit()
+                .putString(FEED_CONFIG_KEY, res.text)
+                .putLong(FEED_CONFIG_TS_KEY, System.currentTimeMillis())
+                .apply()
+        } catch (e: Exception) {
+            // keep the last downloaded copy
+        }
+    }
+
+    /** Called at app start so the account shelves exist when the home page opens. */
+    fun warmUp() {
+        CoroutineScope(Dispatchers.IO).launch { refreshAccountsIfStale() }
+    }
     // ---------- Main page ----------
 
     // Same picks for the whole 6-hour window (local time), a new random set after that.
@@ -120,6 +150,7 @@ class RaindropFeedProvider : MainAPI() {
         }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        if (page == 1) refreshAccountsIfStale()
         val data = request.data
         val search = when {
             data == "priority" -> "#$priorityTag"
