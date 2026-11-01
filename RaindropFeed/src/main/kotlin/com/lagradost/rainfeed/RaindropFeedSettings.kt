@@ -19,8 +19,8 @@ private const val FEED_PREFS = "raindrop_feed_settings"
 const val DEFAULT_PRIORITY =
     "PornMommyPlus,throatdemonz,ZBPGoon,btvvids11,gothbaddiez,sloppygoonettes,throatmoods," +
     "PornMommyPlusS,MommysBestBJs,gooningmoods,ecstasygoonsxxx,HornyJails_,SubbyGooner_," +
-    "certigooners,goonsticklover,GoonGwynn,goonettearchive,Hornymilfv2," +
-    "GoonGirlGalaxy,GoonetteChats,goonersgonewyld,goonettepupxd"
+    "GoonGirlGalaxy,GoonetteChats,goonersgonewyld,goonettepupxd,certigooners,goonsticklover," +
+    "GoonGwynn,goonettearchive,Hornymilfv2"
 
 const val DEFAULT_ACCOUNTS =
     "AestheticBLJB,GoonHours1,Momhavevideo,lahlah084,DrakenAbyss,missAnju_,Hinosbs," +
