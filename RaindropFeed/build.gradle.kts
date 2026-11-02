@@ -1,4 +1,4 @@
-version = 2
+version = 3
 
 cloudstream {
     description = "Per-account video shelves, fed by the X-to-Raindrop sync job (v2)"
