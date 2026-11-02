@@ -15,7 +15,7 @@ private const val FEED_PREFS = "raindrop_feed_settings"
 
 // The one and only account list, shared with the daily sync job.
 const val ACCOUNTS_URL =
-    "https://raw.githubusercontent.com/samih2000/TestPlugins/main/tools/xsync/accounts.json"
+    "https://raw.githubusercontent.com/samih2000/TestPlugins/master/tools/xsync/accounts.json"
 
 fun feedPrefs(context: Context) =
     context.getSharedPreferences(FEED_PREFS, Context.MODE_PRIVATE)
