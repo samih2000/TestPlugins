@@ -2,7 +2,8 @@ name: Sync X videos to Raindrop
 
 on:
   schedule:
-    - cron: "0 2 * * *"   # once a day, 07:00 Pakistan time (GitHub uses UTC)
+    - cron: "17 2 * * *"   # once a day, 07:00 Pakistan time (GitHub uses UTC)
+    - cron: "43 14 * * *"
   workflow_dispatch:
     inputs:
       backfill_pages:
